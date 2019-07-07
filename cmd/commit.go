@@ -1,66 +1,140 @@
 package cmd
 
 import (
+	"flag"
 	"fmt"
-	"log"
+	"io/ioutil"
+	"os"
+	"strings"
 
 	"github.com/driusan/dgit/git"
 )
 
+func printNoUserMessage(committer git.Person) {
+	fmt.Fprintf(os.Stderr, ` Committer: %v
+Your name and email address were configured automatically based
+on your username and hostname. Please check that they are accurate.
+You can suppress this message by setting them explicitly. Run the
+following commands:
+
+	dgit config --global user.name 'Your Name'
+	dgit config --global user.email your@email
+
+After doing this, you may fix the identity used for this commit with:
+
+	dgit commit --amend --reset-author
+`, committer)
+}
+
 // Commit implements the command "git commit" in the repository pointed
 // to by c.
 func Commit(c *git.Client, args []string) (string, error) {
-	// get the parent commit, if it exists
-	var commitTreeArgs []string
-	if parentCommit, err := c.GetHeadID(); err == nil {
-		commitTreeArgs = []string{"-p", parentCommit}
-	}
-
 	// extract the message parameters that get passed directly
 	//to commit-tree
-	var messages []string
-	var msgIncluded bool
-	for idx, val := range args {
-		switch val {
-		case "-m", "-F":
-			msgIncluded = true
-			messages = append(messages, args[idx:idx+2]...)
-		}
+	var opts git.CommitOptions
+
+	flags := flag.NewFlagSet("commit", flag.ExitOnError)
+	flags.SetOutput(flag.CommandLine.Output())
+	flags.Usage = func() {
+		flag.Usage()
+		fmt.Fprintf(flag.CommandLine.Output(), "\n\nOptions:\n")
+		flags.PrintDefaults()
 	}
-	if !msgIncluded {
-		s, err := getStatus(c, "# ")
+
+	var message []string
+	flags.Var(NewMultiStringValue(&message), "message", "Use the given message as the commit message")
+	flags.Var(NewMultiStringValue(&message), "m", "Alias for --message")
+
+	var messageFile string
+	flags.Var(newAliasedStringValue(&messageFile, ""), "file", "Take the commit message from the given file.")
+	flags.Var(newAliasedStringValue(&messageFile, ""), "f", "Alias for --file")
+
+	flags.BoolVar(&opts.Amend, "amend", false, "")
+	flags.BoolVar(&opts.ResetAuthor, "reset-author", false, "")
+	flags.BoolVar(&opts.AllowEmpty, "allow-empty", false, "")
+	flags.BoolVar(&opts.AllowEmptyMessage, "allow-empty-message", false, "")
+
+	flags.BoolVar(&opts.Quiet, "quiet", false, "Suppress printing of commit id")
+	flags.BoolVar(&opts.Quiet, "q", false, "Alias of --quiet")
+
+	edit := false
+	flags.BoolVar(&edit, "edit", false, "")
+	flags.BoolVar(&edit, "e", false, "Alias for --edit")
+
+	_ = flags.Bool("no-edit", false, "")
+
+	flags.StringVar(&opts.CleanupMode, "cleanup", "", "")
+
+	flags.BoolVar(&opts.All, "all", false, "")
+	flags.BoolVar(&opts.All, "a", false, "Alias for --all")
+
+	adjustedArgs := []string{}
+	for _, a := range args {
+		// Unglue any glued -m arguments
+		if strings.HasPrefix(a, "-m") && a != "-m" {
+			adjustedArgs = append(adjustedArgs, "-m", a[2:])
+			continue
+		}
+		adjustedArgs = append(adjustedArgs, a)
+	}
+
+	flags.Parse(adjustedArgs)
+
+	opts.NoEdit = true
+
+	if messageFile != "" {
+		f, err := ioutil.ReadFile(messageFile)
+		if err != nil {
+			return "", err
+		}
+		message = append(message, string(f))
+	}
+
+	if len(message) == 0 || edit {
+		opts.NoEdit = false
+	}
+
+	finalMessage := strings.Join(message, "\n\n") + "\n"
+
+	if !opts.NoEdit {
+		s, err := git.StatusLong(
+			c,
+			nil,
+			git.StatusUntrackedAll,
+			"# ",
+		)
 		if err != nil {
 			return "", err
 		}
 
-		c.GitDir.WriteFile("COMMIT_EDITMSG", []byte("\n"+s), 0660)
+		c.GitDir.WriteFile("COMMIT_EDITMSG", []byte(finalMessage+s), 0660)
 		if err := c.ExecEditor(c.GitDir.File("COMMIT_EDITMSG")); err != nil {
-			log.Println(err)
+			return "", err
 		}
-		commitTreeArgs = append(commitTreeArgs, "-F", c.GitDir.File("COMMIT_EDITMSG").String())
+		m2, err := ioutil.ReadFile(c.GitDir.File("COMMIT_EDITMSG").String())
+		if err != nil {
+			return "", err
+		}
+		finalMessage = string(m2)
 	}
-	commitTreeArgs = append(commitTreeArgs, messages...)
 
-	// write the current index tree and get the SHA1
-	treeSha1 := WriteTree(c)
-	commitTreeArgs = append(commitTreeArgs, treeSha1)
-
-	// write the commit tree
-	commitSha1, err := CommitTree(c, commitTreeArgs)
-	if err != nil {
+	filesStr := flags.Args()
+	var files []git.File
+	for _, f := range filesStr {
+		files = append(files, git.File(f))
+	}
+	cmt, err := git.Commit(c, opts, git.CommitMessage(finalMessage), files)
+	switch err {
+	case git.NoGlobalConfig:
+		committer, _ := c.GetCommitter(nil)
+		printNoUserMessage(committer)
+		fallthrough
+	case nil:
+		if opts.Quiet {
+			return "", nil
+		}
+		return cmt.String(), nil
+	default:
 		return "", err
 	}
-	file := c.GitDir.File("COMMIT_EDITMSG")
-	msg, _ := file.ReadFirstLine()
-	if msg == "" {
-		msg = "commit from go-git"
-	}
-	refmsg := fmt.Sprintf("commit: %s (go-git)", msg)
-
-	oldHead, err := c.GetHeadCommit()
-	if err != nil {
-		return "", err
-	}
-	err = git.UpdateRef(c, git.UpdateRefOptions{OldValue: oldHead, CreateReflog: true}, "HEAD", commitSha1, refmsg)
-	return commitSha1.String(), err
 }

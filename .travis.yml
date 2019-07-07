@@ -1,0 +1,25 @@
+language: go
+
+go:
+  - "1.10.x"
+  - "1.11.x"
+  - "1.12.x"
+  - master
+
+go_import_path: github.com/driusan/dgit
+
+script:
+    - GOOS=darwin go build
+    - GOOS=netbsd go build
+    - GOOS=plan9 go get ./...
+    - GOOS=plan9 go build
+    - GOOS=windows go build
+    - pwd
+    - diff -u <(echo -n) <(gofmt -d cmd git *.go)
+    - go test -v ./...
+    - chmod u+x ./go-get-tests.sh
+    - ./go-get-tests.sh
+    - ./go-get-modules-tests.sh
+    - chmod u+x ./official-git/run-tests.sh
+    - ./official-git/run-tests.sh
+

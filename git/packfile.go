@@ -2,7 +2,6 @@ package git
 
 import (
 	"bytes"
-	"errors"
 	"fmt"
 	"io"
 
@@ -10,7 +9,6 @@ import (
 )
 
 var debug bool = false
-var ObjectExists = errors.New("Object already exists")
 
 type PackfileHeader struct {
 	Signature [4]byte
@@ -48,7 +46,7 @@ func (t PackEntryType) String() string {
 	case OBJ_REF_DELTA:
 		return "ref_delta"
 	default:
-		return "unknown"
+		return fmt.Sprintf("unknown: 0x%x", uint8(t))
 	}
 }
 
@@ -67,7 +65,9 @@ func (p PackfileHeader) ReadHeaderSize(r io.Reader) (PackEntryType, PackEntrySiz
 	// headers should be less than 32 bytes.
 	dataread := make([]byte, 0, 32)
 	for {
-		r.Read(b)
+		if _, err := r.Read(b); err != nil {
+			panic(err)
+		}
 		dataread = append(dataread, b...)
 		if i == 0 {
 			// Extract bits 2-4, which contain the type
@@ -106,9 +106,12 @@ func (p PackfileHeader) ReadHeaderSize(r io.Reader) (PackEntryType, PackEntrySiz
 	}
 	switch entrytype {
 	case OBJ_REF_DELTA:
-		n, err := r.Read(refDelta)
-		if n != 20 || err != nil {
+		n, err := io.ReadFull(r, refDelta)
+		if err != nil {
 			panic(err)
+		}
+		if n != 20 {
+			panic(fmt.Sprintf("Could not read refDelta base. Got %v (%x) instead of 20 bytes", n, refDelta[:n]))
 		}
 		dataread = append(dataread, refDelta...)
 		sha, err := Sha1FromSlice(refDelta)
@@ -124,7 +127,45 @@ func (p PackfileHeader) ReadHeaderSize(r io.Reader) (PackEntryType, PackEntrySiz
 	return entrytype, size, Sha1{}, 0, dataread
 }
 
-func (p PackfileHeader) ReadEntryDataStream(r io.ReadSeeker) (uncompressed []byte, compressed []byte) {
+// This is a hack to ensure zlib only reads 1 byte at a time and
+// doesn't overshoot, since we have no way to rewind the reader.
+type byteReader struct {
+	r io.Reader
+	n int
+}
+
+func (b *byteReader) Read(buf []byte) (int, error) {
+	n, err := b.r.Read(buf)
+	b.n += n
+	return n, err
+}
+
+func (b *byteReader) ReadByte() (byte, error) {
+	buf := make([]byte, 1)
+	n, err := b.Read(buf)
+	if err != nil {
+		return 0, err
+	}
+	if n != 1 {
+		return 0, fmt.Errorf("Unexpected number of bytes read. Got %v", n)
+	}
+	return buf[0], nil
+}
+
+func (p PackfileHeader) readEntryDataStream1(r io.Reader) []byte {
+	b := new(bytes.Buffer)
+	zr, err := zlib.NewReader(r)
+	if err != nil {
+		panic(err)
+	}
+	defer zr.Close()
+	if _, err := io.Copy(b, zr); err != nil {
+		panic(err)
+	}
+	return b.Bytes()
+}
+
+func (p PackfileHeader) readEntryDataStream2(r io.ReadSeeker) (uncompressed []byte, compressed []byte) {
 	b := new(bytes.Buffer)
 	bookmark, _ := r.Seek(0, 1)
 	zr, err := zlib.NewReader(r)
@@ -171,7 +212,6 @@ func (p PackfileHeader) ReadEntryDataStream(r io.ReadSeeker) (uncompressed []byt
 	r.Read(compressed)
 	r.Seek(finalAddress, 0)
 	return b.Bytes(), compressed
-
 }
 
 type VariableLengthInt uint64
@@ -244,8 +284,7 @@ func writeResolvedObject(c *Client, t PackEntryType, rawdata []byte) (Sha1, erro
 		return Sha1{}, fmt.Errorf("Unknown type: %s", t)
 	}
 	sha, err := c.WriteObject(t.String(), rawdata)
-	if err != nil && err != ObjectExists {
-		println(err)
+	if err != nil {
 		return sha, err
 	}
 	return sha, nil

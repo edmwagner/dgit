@@ -32,7 +32,7 @@ func UnpackObjects(c *Client, opts UnpackObjectsOptions, r io.ReadSeeker) ([]Sha
 	var p PackfileHeader
 	binary.Read(r, binary.BigEndian, &p)
 	if p.Signature != [4]byte{'P', 'A', 'C', 'K'} {
-		return nil, fmt.Errorf("Invalid packfile.")
+		return nil, fmt.Errorf("Invalid packfile: %+v", p.Signature)
 	}
 	if p.Version != 2 {
 		return nil, fmt.Errorf("Unsupported packfile version: %d", p.Version)
@@ -62,7 +62,7 @@ func UnpackObjects(c *Client, opts UnpackObjectsOptions, r io.ReadSeeker) ([]Sha
 			return objects, err
 		}
 		t, s, ref, offset, _ := p.ReadHeaderSize(r)
-		rawdata, _ := p.ReadEntryDataStream(r)
+		rawdata := p.readEntryDataStream1(r)
 		switch t {
 		case OBJ_COMMIT, OBJ_TREE, OBJ_BLOB:
 			sha1, err := writeResolvedObject(c, t, rawdata)
@@ -103,7 +103,7 @@ func UnpackObjects(c *Client, opts UnpackObjectsOptions, r io.ReadSeeker) ([]Sha
 				}
 				objects = append(objects, sha1)
 			default:
-				panic(fmt.Sprintf("TODO: Unhandled type", t))
+				panic(fmt.Sprintf("TODO: Unhandled type %v", t))
 
 			}
 		case OBJ_REF_DELTA:
@@ -132,10 +132,10 @@ func UnpackObjects(c *Client, opts UnpackObjectsOptions, r io.ReadSeeker) ([]Sha
 				resolvedReferences[sha1] = resolvedDelta{deltadata, t}
 				mu.Unlock()
 			default:
-				panic(fmt.Sprintf("TODO: Unhandled type", t))
+				panic(fmt.Sprintf("TODO: Unhandled type %v", t))
 			}
 		default:
-			panic(fmt.Sprintf("TODO: Unhandled type", t))
+			panic(fmt.Sprintf("TODO: Unhandled type %v", t))
 		}
 
 		if len(rawdata) != int(s) {

@@ -1,7 +1,10 @@
 package git
 
 import (
+	"bytes"
 	"fmt"
+	"io/ioutil"
+	"os"
 )
 
 // CheckoutOptions represents the options that may be passed to
@@ -19,10 +22,9 @@ type CheckoutOptions struct {
 	// Not implemented
 	Stage Stage
 
-	// Not implemented
-	Branch string // -b
-	// Not implemented
-	ForceBranch bool // use branch as -B
+	Branch      string // -b
+	ForceBranch bool   // use branch as -B
+
 	// Not implemented
 	OrphanBranch bool // use branch as --orphan
 
@@ -34,15 +36,14 @@ type CheckoutOptions struct {
 	// Not implemented
 	Detach bool
 
-	// Not implemented
 	IgnoreSkipWorktreeBits bool
+
 	// Not implemented
 	Merge bool
 
 	// Not implemented.
 	ConflictStyle string
 
-	// Not implemented
 	Patch bool
 
 	// Not implemented
@@ -67,6 +68,36 @@ type CheckoutOptions struct {
 func Checkout(c *Client, opts CheckoutOptions, thing string, files []File) error {
 	if thing == "" {
 		thing = "HEAD"
+	}
+
+	if opts.Patch {
+		diffs, err := DiffFiles(c, DiffFilesOptions{}, files)
+		if err != nil {
+			return err
+		}
+		var patchbuf bytes.Buffer
+		if err := GeneratePatch(c, DiffCommonOptions{Patch: true}, diffs, &patchbuf); err != nil {
+			return err
+		}
+		hunks, err := splitPatch(patchbuf.String(), false)
+		if err != nil {
+			return err
+		}
+		hunks, err = filterHunks("discard this hunk from the work tree", hunks)
+		if err == userAborted {
+			return nil
+		} else if err != nil {
+			return err
+		}
+
+		patch, err := ioutil.TempFile("", "checkoutpatch")
+		if err != nil {
+			return err
+		}
+		defer os.Remove(patch.Name())
+		recombinePatch(patch, hunks)
+
+		return Apply(c, ApplyOptions{Reverse: true}, []File{File(patch.Name())})
 	}
 
 	if len(files) == 0 {
@@ -99,45 +130,140 @@ func CheckoutCommit(c *Client, opts CheckoutOptions, commit Commitish) error {
 		newRefspec = RefSpec("refs/heads/" + opts.Branch)
 		refspecfile := newRefspec.File(c)
 		if refspecfile.Exists() && !opts.ForceBranch {
-			return fmt.Errorf("Branch %s already exists.", opts.Branch)
+			return fmt.Errorf("fatal: A branch named '%v' already exists.", opts.Branch)
 		}
 	}
 	// Get the original HEAD for the reflog
+	var head Commitish
 	head, err := SymbolicRefGet(c, SymbolicRefOptions{}, "HEAD")
-	if err != nil {
+	switch err {
+	case DetachedHead:
+		head, err = c.GetHeadCommit()
+		if err != nil {
+			return err
+		}
+	case nil:
+	default:
 		return err
 	}
-	// Get the original HEAD branchname
-	origB := Branch(head).BranchName()
-	if origB == "" {
-		return DetachedHead
-	}
 
-	// Convert from Commitish to Treeish for ReadTree
+	// Convert from Commitish to Treeish for ReadTree and LsTree
 	cid, err := commit.CommitID(c)
 	if err != nil {
 		return err
 	}
 
+	if !opts.Force {
+		// Check that nothing would be lost
+		lstree, err := LsTree(c, LsTreeOptions{Recurse: true}, cid, nil)
+		if err != nil {
+			return err
+		}
+		newfiles := make([]File, 0, len(lstree))
+		for _, entry := range lstree {
+			f, err := entry.PathName.FilePath(c)
+			if err != nil {
+				return err
+			}
+			newfiles = append(newfiles, f)
+		}
+		untracked, err := LsFiles(c, LsFilesOptions{Others: true}, newfiles)
+		if err != nil {
+			return err
+		}
+		if len(untracked) > 0 {
+			err := "error: The following untracked working tree files would be overwritten by checkout:\n"
+			for _, f := range untracked {
+				err += "\t" + f.IndexEntry.PathName.String() + "\n"
+			}
+			err += "Please move or remove them before you switch branches.\nAborting"
+			return fmt.Errorf("%v", err)
+		}
+	}
+
+	// "head" is a Commitish, but we need a Treeish, so just resolve it
+	// to a commit.
+	hc, err := head.CommitID(c)
+	if err != nil {
+		return err
+	}
+	staged, err := DiffIndex(c, DiffIndexOptions{}, nil, hc, nil)
+	// Now actually read the tree into the index
+	readtreeopts := ReadTreeOptions{Update: true, Merge: true}
+	if opts.Force {
+		readtreeopts.Merge = false
+		readtreeopts.Reset = true
+	}
+	if opts.IgnoreSkipWorktreeBits {
+		readtreeopts.NoSparseCheckout = true
+	}
+	idx, err := ReadTree(c, readtreeopts, cid)
+	if err != nil {
+		return err
+	}
+
+	// Put back changes that were staged before doing read-tree -u
+	for _, diff := range staged {
+		if diff.Dst.Sha1 == (Sha1{}) {
+			continue
+		}
+		if err := idx.AddStage(c, diff.Name, diff.Dst.FileMode, diff.Dst.Sha1, Stage0, uint32(diff.DstSize), 0, UpdateIndexOptions{}); err != nil {
+			return err
+		}
+		content, err := CatFile(c, "blob", diff.Dst.Sha1, CatFileOptions{})
+		if err != nil {
+			return err
+		}
+		f, err := diff.Name.FilePath(c)
+		if err != nil {
+			return err
+		}
+		if err := ioutil.WriteFile(f.String(), []byte(content), os.FileMode(diff.Dst.FileMode)); err != nil {
+			return err
+		}
+	}
+
+	f, err := c.GitDir.Create("index")
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	if err := idx.WriteIndex(f); err != nil {
+		return err
+	}
+
+	var origB string
+	// Get the original HEAD branchname for the reflog
+	//origB = Branch(head).BranchName()
+	switch h := head.(type) {
+	case RefSpec:
+		origB = Branch(h).BranchName()
+	default:
+		if h, err := head.CommitID(c); err == nil {
+			origB = h.String()
+		}
+	}
+
+	if opts.Branch != "" {
+		// In the case of -B (ForceBranch) this will slam in the new branch based on the provided commit ID
+		if err := c.CreateBranch(opts.Branch, cid); err != nil {
+			return err
+		}
+		refmsg := fmt.Sprintf("checkout: moving from %s to %s (dgit)", origB, opts.Branch)
+		return SymbolicRefUpdate(c, SymbolicRefOptions{}, "HEAD", RefSpec("refs/heads/"+opts.Branch), refmsg)
+	}
 	if b, ok := commit.(Branch); ok && !opts.Detach {
 		// We're checking out a branch, first read the new tree, and
 		// then update the SymbolicRef for HEAD, if that succeeds.
-		_, err := ReadTree(c, ReadTreeOptions{Update: true, Merge: true}, cid)
-		if err != nil {
-			return err
-		}
-
-		refmsg := fmt.Sprintf("checkout: moving from %s to %s (go-git)", origB, b.BranchName())
+		refmsg := fmt.Sprintf("checkout: moving from %s to %s (dgit)", origB, b.BranchName())
 		return SymbolicRefUpdate(c, SymbolicRefOptions{}, "HEAD", RefSpec(b), refmsg)
 	}
-	refmsg := fmt.Sprintf("checkout: moving from %s to %s (go-git)", origB, cid)
-	/*
-		origValue, err := head.Value(c)
-		if err != nil {
-			return err
-		}
-	*/
-	return UpdateRef(c, UpdateRefOptions{NoDeref: true, OldValue: head}, "HEAD", cid, refmsg)
+	refmsg := fmt.Sprintf("checkout: moving from %s to %s (dgit)", origB, cid)
+	if err := UpdateRef(c, UpdateRefOptions{NoDeref: true, OldValue: head}, "HEAD", cid, refmsg); err != nil {
+		return err
+	}
+	return nil
 }
 
 // Implements "git checkout" subcommand of git for variations:
@@ -149,12 +275,38 @@ func CheckoutFiles(c *Client, opts CheckoutOptions, tree Treeish, files []File) 
 	//
 	// If they weren't, we want to checkout a treeish, so let ReadTree update
 	// the workdir so that we don't lose any changes.
-	updateAll := (len(files) == 0)
-	i, err := ReadTree(c, ReadTreeOptions{Update: updateAll, Merge: updateAll}, tree)
+	// Load the index so that we can check the skip worktree bit if applicable
+	index, err := c.GitDir.ReadIndex()
 	if err != nil {
 		return err
 	}
-	// ReadTree wrote the index to disk, but since we already have a copy in
-	// memory we use the Uncommited variation.
-	return CheckoutIndexUncommited(c, i, CheckoutIndexOptions{Force: true}, files)
+	imap := index.GetMap()
+	expandedfiles, err := LsTree(c, LsTreeOptions{Recurse: true}, tree, files)
+	if err != nil {
+		return err
+	}
+	files = make([]File, 0, len(files))
+	for _, entry := range expandedfiles {
+		f, err := entry.PathName.FilePath(c)
+		if err != nil {
+			return err
+		}
+		if opts.IgnoreSkipWorktreeBits {
+			files = append(files, f)
+			continue
+		}
+		if entry, ok := imap[entry.PathName]; ok && entry.SkipWorktree() {
+			continue
+		}
+		files = append(files, f)
+	}
+
+	// We just want to load the tree as an index so that CheckoutIndexUncommited, so we
+	// specify DryRun.
+	treeidx, err := ReadTree(c, ReadTreeOptions{DryRun: true}, tree)
+	if err != nil {
+		return err
+	}
+
+	return CheckoutIndexUncommited(c, treeidx, CheckoutIndexOptions{Force: true, UpdateStat: true}, files)
 }

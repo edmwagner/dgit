@@ -1,273 +1,114 @@
 package cmd
 
 import (
+	"flag"
 	"fmt"
-	"io/ioutil"
 	"os"
-	"strings"
 
 	"github.com/driusan/dgit/git"
 )
 
-type stagedFile struct {
-	Filename git.IndexPath
-	New      bool
-	Removed  bool
-}
-
-type unmergedFile struct {
-	Stage1, Stage2, Stage3 git.Sha1
-}
-
-func findUntrackedFilesFromDir(c *git.Client, root, parent, dir string, tracked map[git.IndexPath]bool) (untracked []git.File) {
-	files, err := ioutil.ReadDir(dir)
-	if err != nil {
-		return nil
-	}
-
-	for _, fi := range files {
-		if fi.IsDir() {
-			if fi.Name() == ".git" {
-				continue
-			}
-			recurseFiles := findUntrackedFilesFromDir(c, root, parent+"/"+fi.Name(), dir+"/"+fi.Name(), tracked)
-			untracked = append(untracked, recurseFiles...)
-		} else {
-			indexPath := git.IndexPath(strings.TrimPrefix(parent+"/"+fi.Name(), root))
-			if _, ok := tracked[indexPath]; !ok {
-				rel, err := indexPath.FilePath(c)
-				if err != nil {
-					panic(err)
-				}
-				untracked = append(untracked, rel)
-			}
-		}
-	}
-	return
-}
-func findUntrackedFiles(c *git.Client, tracked map[git.IndexPath]bool) []git.File {
-	if c.WorkDir == "" {
-		return nil
-	}
-	wd := string(c.WorkDir)
-	return findUntrackedFilesFromDir(c, wd+"/", wd, wd, tracked)
-}
-
-// The standard git "status" command doesn't provide any kind of --prefix, so
-// this does the work of status, and adds a --prefix for commit to share the
-// same code as Status. Status() just parses command line options and calls
-// this.
-func getStatus(c *git.Client, prefix string) (string, error) {
-
-	idx, err := c.GitDir.ReadIndex()
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "%v\n", err)
-	}
-	fileInIndex := make(map[git.IndexPath]bool)
-	stagedFiles := make([]stagedFile, 0)
-	unstagedFiles := make([]stagedFile, 0)
-	unmergedFiles := make(map[git.IndexPath]*unmergedFile)
-
-	headFiles := make(map[git.IndexPath]git.Sha1)
-	// This isn't very efficiently implemented, but it works(ish).
-	h, err := c.GetHeadCommit()
-	if err != nil {
-		return "", err
-	}
-	head, err := git.ExpandGitTreeIntoIndexes(c, h, true, false)
-	if err != nil {
-		return "", err
-	}
-	for _, head := range head {
-		headFiles[head.PathName] = head.Sha1
-	}
-
-	for _, file := range idx.Objects {
-		fileInIndex[file.PathName] = true
-		idxsha1 := file.Sha1
-
-		switch file.Stage() {
-		case git.Stage0:
-			break
-		case git.Stage1:
-			if uf, ok := unmergedFiles[file.PathName]; ok {
-				uf.Stage1 = file.Sha1
-			} else {
-				unmergedFiles[file.PathName] = &unmergedFile{
-					Stage1: file.Sha1,
-				}
-			}
-			continue
-		case git.Stage2:
-			if uf, ok := unmergedFiles[file.PathName]; ok {
-				uf.Stage2 = file.Sha1
-			} else {
-				unmergedFiles[file.PathName] = &unmergedFile{
-					Stage2: file.Sha1,
-				}
-			}
-			continue
-		case git.Stage3:
-			if uf, ok := unmergedFiles[file.PathName]; ok {
-				uf.Stage3 = file.Sha1
-			} else {
-				unmergedFiles[file.PathName] = &unmergedFile{
-					Stage3: file.Sha1,
-				}
-			}
-			continue
-		default:
-			panic("Invalid stage")
-		}
-		relname, err := file.PathName.FilePath(c)
-		if err != nil {
-			panic(err)
-		}
-		fssha1, _, err := git.HashFile("blob", relname.String())
-		if err != nil {
-			if os.IsNotExist(err) {
-				fssha1 = git.Sha1{}
-			} else {
-				fmt.Fprintf(os.Stderr, "%v\n", err)
-				continue
-			}
-		}
-
-		headSha1, headExists := headFiles[file.PathName]
-		if !headExists {
-			stagedFiles = append(stagedFiles,
-				stagedFile{
-					Filename: file.PathName,
-					New:      true,
-					Removed:  false,
-				},
-			)
-			continue
-		}
-		if fssha1 != idxsha1 {
-			_, err := os.Stat(relname.String())
-			if os.IsNotExist(err) {
-				unstagedFiles = append(unstagedFiles,
-					stagedFile{file.PathName, false, true},
-				)
-			} else {
-				unstagedFiles = append(unstagedFiles,
-					stagedFile{file.PathName, false, false},
-				)
-			}
-
-		}
-		if headSha1 != idxsha1 {
-			_, err := os.Stat(relname.String())
-			if os.IsNotExist(err) {
-				stagedFiles = append(stagedFiles,
-					stagedFile{file.PathName, false, true},
-				)
-			} else {
-				stagedFiles = append(stagedFiles,
-					stagedFile{file.PathName, false, false},
-				)
-			}
-		}
-	}
-
-	for file, _ := range headFiles {
-		if _, ok := fileInIndex[file]; !ok {
-			stagedFiles = append(stagedFiles,
-				stagedFile{file, false, true},
-			)
-		}
-	}
-
-	var msg string
-
-	untracked := findUntrackedFiles(c, fileInIndex)
-	if len(stagedFiles) != 0 {
-		msg += fmt.Sprintf("%sChanges to be committed:\n", prefix)
-		msg += fmt.Sprintf("%s (use \"git reset HEAD <file>...\" to unstage)\n", prefix)
-		msg += fmt.Sprintf("%s\n", prefix)
-		for _, f := range stagedFiles {
-			file, err := f.Filename.FilePath(c)
-			if err != nil {
-				panic(err)
-			}
-			if f.New {
-				msg += fmt.Sprintf("%s\tnew file:\t%s\n", prefix, file)
-			} else if f.Removed {
-				msg += fmt.Sprintf("%s\tdeleted:\t%s\n", prefix, file)
-			} else {
-				msg += fmt.Sprintf("%s\tmodified:\t%s\n", prefix, file)
-			}
-		}
-	}
-
-	if len(unmergedFiles) != 0 {
-		msg += fmt.Sprintf("%s\n", prefix)
-		msg += fmt.Sprintf("%sUnmerged paths:\n", prefix)
-		msg += fmt.Sprintf("%s (use \"git reset HEAD <file>...\" to unstage)\n", prefix)
-		msg += fmt.Sprintf("%s (use \"git add/rm <file>...\" as appropriate to mark resolution)\n", prefix)
-		msg += fmt.Sprintf("%s\n", prefix)
-
-		for path, status := range unmergedFiles {
-			file, err := path.FilePath(c)
-			if err != nil {
-				panic(err)
-			}
-
-			var empty git.Sha1
-			if status.Stage2 == empty && status.Stage3 != empty {
-				msg += fmt.Sprintf("%s\tdeleted by us:\t%s\n", prefix, file)
-			} else if status.Stage2 != empty && status.Stage3 == empty {
-				msg += fmt.Sprintf("%s\tdeleted by them:\t%s\n", prefix, file)
-			} else if status.Stage2 == empty && status.Stage3 == empty {
-				msg += fmt.Sprintf("%s\tdeleted by both:\t%s\n", prefix, file)
-			} else if status.Stage2 != status.Stage3 {
-				msg += fmt.Sprintf("%s\tmodified by both:\t%s\n", prefix, file)
-			}
-		}
-	}
-
-	if len(unstagedFiles) != 0 {
-		msg += fmt.Sprintf("%s\n", prefix)
-		msg += fmt.Sprintf("%sChanges not staged for commit:\n", prefix)
-		msg += fmt.Sprintf("%s\n", prefix)
-		msg += fmt.Sprintf("%s  (use \"git add <file>...\" to update what will be committed)\n", prefix)
-		msg += fmt.Sprintf("%s  (use \"git checkout -- <file>...\" to discard changes in working directory)\n", prefix)
-		msg += fmt.Sprintf("%s\n", prefix)
-		for _, f := range unstagedFiles {
-			file, err := f.Filename.FilePath(c)
-			if err != nil {
-				panic(err)
-			}
-
-			if f.Removed {
-				msg += fmt.Sprintf("%s\tdeleted:\t%s\n", prefix, file)
-			} else {
-				msg += fmt.Sprintf("%s\tmodified:\t%s\n", prefix, file)
-			}
-		}
-	}
-
-	if len(untracked) != 0 {
-		msg += fmt.Sprintf("%s\n", prefix)
-		msg += fmt.Sprintf("%sUntracked files:\n", prefix)
-		msg += fmt.Sprintf("%s  (use \"git add <file>...\" to include in what will be committed)\n", prefix)
-		msg += fmt.Sprintf("%s\n", prefix)
-		for _, f := range untracked {
-			msg += fmt.Sprintf("%s\t%s\n", prefix, f)
-		}
-	}
-
-	if len(unstagedFiles) == 0 && len(stagedFiles) == 0 && len(untracked) == 0 {
-		return "", fmt.Errorf("nothing to commit, working tree clean")
-	}
-	return msg, nil
-}
 func Status(c *git.Client, args []string) error {
-	s, err := getStatus(c, "")
+	flags := flag.NewFlagSet("status", flag.ExitOnError)
+	flags.SetOutput(flag.CommandLine.Output())
+	flags.Usage = func() {
+		flag.Usage()
+		fmt.Fprintf(flag.CommandLine.Output(), "\n\nOptions:\n")
+		flags.PrintDefaults()
+	}
+
+	opts := git.StatusOptions{}
+
+	flags.BoolVar(&opts.Short, "short", false, "Give the output in short format")
+	flags.BoolVar(&opts.Short, "s", false, "Alias of --short")
+
+	flags.BoolVar(&opts.Branch, "branch", false, "Short branch and tracking info, even in short mode")
+	flags.BoolVar(&opts.Branch, "b", false, "Alias of --branch")
+
+	flags.BoolVar(&opts.ShowStash, "show-stash", false, "Show the number of entries currently stashed")
+
+	porcelain := flags.Int("porcelain", 0, "Give the output in a porcelain format")
+
+	flags.BoolVar(&opts.Long, "long", true, "Give the output in long format")
+
+	flags.BoolVar(&opts.Verbose, "verbose", false, "In addition to the modifies files, show a diff")
+	flags.BoolVar(&opts.Verbose, "v", false, "Alias of --verbose")
+
+	uno := flags.Bool("uno", false, "Do not show untracked files")
+	unormal := flags.Bool("unormal", false, "Show untracked files and directories (default)")
+	uall := flags.Bool("uall", false, "Show untracked files and files inside of directories")
+
+	ignoresubmodules := flags.String("ignore-submodules", "", "When to ignore submodules")
+
+	flags.BoolVar(&opts.Ignored, "ignored", false, "Show ignored files as well")
+
+	flags.BoolVar(&opts.NullTerminate, "z", false, "Terminate entries with NULL, not LF. Implies --porcelain=v1 if not specified")
+
+	column := flags.String("column", "default", "Show status in columns (not implemented)")
+
+	nocolumn := flags.Bool("no-column", false, "Equivalent to --column=never")
+
+	adjustedArgs := []string{}
+	for _, a := range args {
+		if a == "--porcelain" {
+			a = "--porcelain=1"
+		}
+		if a == "--ignore-submodules" {
+			a = "--ignore-submodules=all"
+		}
+		if a == "--column" {
+			a = "--column=always"
+		}
+		adjustedArgs = append(adjustedArgs, a)
+	}
+
+	flags.Parse(adjustedArgs)
+
+	switch *porcelain {
+	case 0, 1, 2:
+		opts.Porcelain = uint8(*porcelain)
+	default:
+		fmt.Fprintf(flag.CommandLine.Output(), "Invalid value for --porcelain, must be 0, 1 or 2\n")
+		flags.Usage()
+		os.Exit(2)
+	}
+
+	if *uno {
+		opts.UntrackedMode = git.StatusUntrackedNo
+	} else if *unormal {
+		opts.UntrackedMode = git.StatusUntrackedNormal
+	} else if *uall {
+		opts.UntrackedMode = git.StatusUntrackedAll
+	} else {
+		opts.UntrackedMode = git.StatusUntrackedNormal
+	}
+
+	switch *ignoresubmodules {
+	case "", "all":
+		opts.IgnoreSubmodules = git.StatusIgnoreSubmodulesAll
+	case "none":
+		opts.IgnoreSubmodules = git.StatusIgnoreSubmodulesNone
+	case "untracked":
+		opts.IgnoreSubmodules = git.StatusIgnoreSubmodulesUntracked
+	case "dirty":
+		opts.IgnoreSubmodules = git.StatusIgnoreSubmodulesAll
+	default:
+		fmt.Fprintf(flag.CommandLine.Output(), "Invalid option for --ignore-submodules, must be all, none, untracked or dirty.\n")
+		flags.Usage()
+		os.Exit(2)
+	}
+
+	if *column != "" {
+		opts.Column = git.StatusColumnOptions(*column)
+	}
+	if *nocolumn {
+		opts.Column = "never"
+	}
+
+	status, err := git.Status(c, opts, nil)
 	if err != nil {
 		return err
 	}
-	fmt.Printf("%s", s)
+	fmt.Print(status)
 	return nil
 }

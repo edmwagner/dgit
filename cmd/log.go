@@ -1,53 +1,103 @@
 package cmd
 
 import (
-	"errors"
+	"flag"
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 
 	"github.com/driusan/dgit/git"
-	libgit "github.com/driusan/git"
 )
 
-// Since libgit is somewhat out of our control and we can't implement
-// a fmt.Stringer interface there, we use this helper.
-func printCommit(c *libgit.Commit) {
-	fmt.Printf("commit %v\nAuthor: %v\nDate: %v\n\n", c.Id, c.Author, c.Author.When.Format("Mon Jan 2 15:04:05 2006 -0700"))
-
-	lines := strings.Split(c.CommitMessage, "\n")
-	for _, l := range lines {
-		fmt.Printf("    %v\n", l)
-	}
-}
-
 func Log(c *git.Client, args []string) error {
-
-	if len(args) != 0 {
-		fmt.Fprintf(os.Stderr, "Usage: go-git log\nNo options are currently supported.\n")
-		return errors.New("No options are currently supported for log")
+	flags := flag.NewFlagSet("log", flag.ExitOnError)
+	flags.SetOutput(flag.CommandLine.Output())
+	flags.Usage = func() {
+		flag.Usage()
+		fmt.Fprintf(flag.CommandLine.Output(), "\n\nOptions:\n")
+		flags.PrintDefaults()
 	}
 
-	repo, err := libgit.OpenRepository(c.GitDir.String())
-	if err != nil {
-		return err
-	}
-	head, err := c.GetHeadID()
-	if err != nil {
-		return err
-	}
+	flags.Var(newNotimplBoolValue(), "follow", "Not implemented")
+	flags.Var(newNotimplBoolValue(), "no-decorate", "Not implemented")
+	flags.Var(newNotimplStringValue(), "decorate", "Not implemented")
+	flags.Var(newNotimplStringValue(), "decorate-refs", "Not implemented")
+	flags.Var(newNotimplStringValue(), "decorate-refs-exclude", "Not implemented")
+	flags.Var(newNotimplBoolValue(), "source", "Not implemented")
+	flags.Var(newNotimplBoolValue(), "use-mailmap", "Not implemented")
+	flags.Var(newNotimplBoolValue(), "full-diff", "Not implemented")
+	flags.Var(newNotimplStringValue(), "log-size", "Not implemented")
+	flags.Var(newNotimplStringValue(), "L", "Not implemented")
+	maxCount := -1
+	flags.IntVar(&maxCount, "n", -1, "Limit the number of commits.")
+	flags.IntVar(&maxCount, "max-count", -1, "Alias for -n")
+	format := "medium" // The default
+	flags.StringVar(&format, "format", "medium", "Pretty print the commit logs")
 
-	// CommitsBefore also returns the commit passed..
-	l, err := repo.CommitsBefore(head)
-	if err != nil {
-		return err
-	}
-	for e := l.Front(); e != nil; e = e.Next() {
-		c, ok := e.Value.(*libgit.Commit)
-		if ok {
-			printCommit(c)
+	adjustedArgs := []string{}
+	for _, a := range args {
+		if strings.HasPrefix(a, "-n") && a != "-n" {
+			adjustedArgs = append(adjustedArgs, "-n", a[2:])
+			continue
 		}
+		if strings.HasPrefix(a, "-") && len(a) > 1 {
+			if _, err := strconv.Atoi(a[1:]); err == nil {
+				adjustedArgs = append(adjustedArgs, "-n", a[1:])
+				continue
+			}
+		}
+		adjustedArgs = append(adjustedArgs, a)
 	}
-	return nil
 
+	flags.Parse(adjustedArgs)
+
+	if flags.NArg() > 1 {
+		fmt.Fprintf(flag.CommandLine.Output(), "Paths are not yet implemented, just the revision")
+		flags.Usage()
+		os.Exit(2)
+	}
+
+	var commit git.Commitish
+	var err error
+	if flags.NArg() == 0 {
+		commit, err = git.RevParseCommitish(c, &git.RevParseOptions{}, "HEAD")
+	} else {
+		commit, err = git.RevParseCommitish(c, &git.RevParseOptions{}, flags.Arg(0))
+	}
+	if err != nil {
+		return err
+	}
+
+	opts := git.RevListOptions{Quiet: true}
+	if maxCount >= 0 {
+		mc := uint(maxCount)
+		opts.MaxCount = &mc
+	}
+
+	var commitPrinter func(s git.Sha1) error
+
+	if format == "medium" {
+		commitPrinter = func(s git.Sha1) error {
+			output, err := git.CommitID(s).FormatMedium(c)
+			if err != nil {
+				return err
+			}
+			fmt.Printf("%s", output)
+			return nil
+		}
+	} else if strings.HasPrefix(format, "format:") {
+		commitPrinter = func(s git.Sha1) error {
+			output, err := git.CommitID(s).Format(c, format[7:])
+			if err != nil {
+				return err
+			}
+			fmt.Printf("%s\n", output)
+			return nil
+		}
+	} else {
+		return fmt.Errorf("Format %s is not supported\n", format)
+	}
+
+	return git.RevListCallback(c, opts, []git.Commitish{commit}, nil, commitPrinter)
 }

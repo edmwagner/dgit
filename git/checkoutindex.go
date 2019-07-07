@@ -6,6 +6,7 @@ import (
 	"io"
 	"io/ioutil"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 )
@@ -112,6 +113,28 @@ func checkoutFile(c *Client, entry *IndexEntry, opts CheckoutIndexOptions) error
 	}
 	if !opts.NoCreate {
 		fmode := os.FileMode(entry.Mode)
+		if f.Exists() && f.IsDir() {
+			if err := os.RemoveAll(f.String()); err != nil {
+				return err
+			}
+		}
+
+		p := filepath.Dir(f.String())
+		if f := File(p); !f.Exists() {
+			if err := os.MkdirAll(p, 0777); err != nil {
+				return err
+			}
+		} else if !f.IsDir() {
+			// FIXME: This shouldn't be required, this
+			// should be handled by being returned by
+			// ls-files -k before we get to this point.
+			if err := os.Remove(f.String()); err != nil {
+				return err
+			}
+			if err := os.MkdirAll(p, 0777); err != nil {
+				return err
+			}
+		}
 		err := ioutil.WriteFile(f.String(), obj.GetContent(), fmode)
 		if err != nil {
 			return err
@@ -120,21 +143,16 @@ func checkoutFile(c *Client, entry *IndexEntry, opts CheckoutIndexOptions) error
 	}
 
 	// Update the stat information, but only if it's the same
-	// file name. We only change the mtime, because the only
+	// file name. We only change the mtime, and ctime because the only
 	// other thing we track is the file size, and that couldn't
 	// have changed.
 	// Don't change the stat info if there's a prefix, because
-	// if we're checkout out into a prefix, it means we haven't
+	// if we checkout out into a prefix, it means we haven't
 	// touched the index.
-	if opts.UpdateStat && opts.Prefix == "" {
-		fstat, err := f.Stat()
-		if err != nil {
+	if opts.Prefix == "" && opts.UpdateStat {
+		if err := entry.RefreshStat(c); err != nil {
 			return err
 		}
-
-		modTime := fstat.ModTime()
-		entry.Mtime = uint32(modTime.Unix())
-		entry.Mtimenano = uint32(modTime.Nanosecond())
 	}
 	return nil
 }
@@ -156,6 +174,39 @@ func CheckoutIndexUncommited(c *Client, idx *Index, opts CheckoutIndexOptions, f
 		}
 	}
 
+	killed, err := LsFiles(c, LsFilesOptions{Killed: true}, files)
+	if err != nil {
+		return err
+	}
+	if len(killed) > 0 {
+		if !opts.Force {
+			msg := ""
+			for i, path := range killed {
+				if i > 0 {
+					msg += "\n"
+
+				}
+				f, err := path.PathName.FilePath(c)
+				if err != nil {
+					return err
+				}
+				msg += fmt.Sprintf("fatal: cannot create directory at '%v': File exists", f)
+			}
+			return fmt.Errorf("%v", msg)
+		} else {
+			for _, file := range killed {
+				f, err := file.PathName.FilePath(c)
+				if err != nil {
+					return err
+				}
+
+				if err := os.RemoveAll(f.String()); err != nil {
+					return err
+				}
+			}
+		}
+	}
+
 	var stageMap map[IndexStageEntry]*IndexEntry
 	if opts.Stage == "all" {
 		// This is only used if stage==all, but we don't want to reallocate
@@ -169,7 +220,8 @@ func CheckoutIndexUncommited(c *Client, idx *Index, opts CheckoutIndexOptions, f
 	}
 
 	for _, file := range files {
-		indexpath, err := File(file).IndexPath(c)
+		fname := File(file)
+		indexpath, err := fname.IndexPath(c)
 		if err != nil {
 			if !opts.Quiet {
 				fmt.Fprintf(os.Stderr, "%v\n", err)
@@ -184,7 +236,7 @@ func CheckoutIndexUncommited(c *Client, idx *Index, opts CheckoutIndexOptions, f
 					// but it's what the official git client says when
 					// you try and checkout-index --stage=all a file that isn't
 					// in conflict.
-					fmt.Fprintf(os.Stderr, "git checkout-index: %v does not exist at stage 4\n", indexpath)
+					fmt.Fprintf(os.Stderr, "git checkout-index: %v does not exist at stage 0\n", indexpath)
 				}
 				continue
 			}
@@ -222,12 +274,17 @@ func CheckoutIndexUncommited(c *Client, idx *Index, opts CheckoutIndexOptions, f
 			if entry.PathName != indexpath {
 				continue
 			}
-			if entry.PathName.IsClean(c, entry.Sha1) && !opts.Temp {
+
+			if !opts.Temp && !opts.Force && opts.Prefix == "" && entry.PathName.IsClean(c, entry.Sha1) {
 				// don't bother checkout out the file
 				// if it's already clean. This makes us less
 				// likely to avoid GetObject have an error
 				// trying to read from a packfile (which isn't
 				// supported yet.)
+				// We don't check this if there's a prefix, since it's not checking out
+				// into the same location as the index.
+				// FIXME: This should use stat information, not hash
+				// the whole file.
 				continue
 			}
 
@@ -278,7 +335,6 @@ func CheckoutIndexUncommited(c *Client, idx *Index, opts CheckoutIndexOptions, f
 		}
 		defer f.Close()
 		return idx.WriteIndex(f)
-
 	}
 	return nil
 }

@@ -10,20 +10,28 @@ import (
 )
 
 func HashObject(c *git.Client, args []string) {
-	var t string
-	var write, stdin, stdinpaths bool
-	flag.StringVar(&t, "t", "blob", "-t object type")
-	flag.BoolVar(&write, "w", false, "-w")
-	flag.BoolVar(&stdin, "stdin", false, "--stdin to read an object from stdin")
-	flag.BoolVar(&stdinpaths, "stdin-paths", false, "--stdin-paths to read a list of files from stdin")
+	flags := flag.NewFlagSet("hash-object", flag.ExitOnError)
+	flags.SetOutput(flag.CommandLine.Output())
+	flags.Usage = func() {
+		flag.Usage()
+		fmt.Fprintf(flag.CommandLine.Output(), "\n\nOptions:\n")
+		flags.PrintDefaults()
+	}
 
-	fakeargs := []string{"git-hash-object"}
-	os.Args = append(fakeargs, args...)
-	flag.Parse()
+	var t string
+	var write, stdin, stdinpaths, literally bool
+	flags.StringVar(&t, "t", "blob", "-t object type")
+	flags.BoolVar(&write, "w", false, "-w")
+	flags.BoolVar(&stdin, "stdin", false, "--stdin to read an object from stdin")
+	flags.BoolVar(&stdinpaths, "stdin-paths", false, "--stdin-paths to read a list of files from stdin")
+	flags.BoolVar(&literally, "literally", false, "Do not apply any filters to things being hashed")
+
+	flags.Parse(args)
 
 	if stdin && stdinpaths {
-		fmt.Fprintln(os.Stderr, "Can not use both --stdin and --stdin-paths\n")
-		return
+		fmt.Fprintln(flag.CommandLine.Output(), "Can not use both --stdin and --stdin-paths")
+		flags.Usage()
+		os.Exit(2)
 	}
 
 	if stdin {
@@ -60,7 +68,7 @@ func HashObject(c *git.Client, args []string) {
 		}
 		return
 	} else {
-		files := flag.Args()
+		files := flags.Args()
 		for _, file := range files {
 			h, data, err := git.HashFile(t, file)
 			if err != nil {

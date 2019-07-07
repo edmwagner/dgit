@@ -4,6 +4,9 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
+	"log"
+	"os"
+	"path/filepath"
 	"strings"
 )
 
@@ -18,6 +21,7 @@ type GitConfigSection struct {
 }
 type GitConfig struct {
 	sections []GitConfigSection
+	fname    string
 }
 
 func (g *GitConfig) SetConfig(name, value string) {
@@ -30,16 +34,55 @@ argChecker:
 	case 2:
 		key = strings.TrimSpace(pieces[1])
 		for _, section := range g.sections {
-			fmt.Printf("Comparing %s to %s\n", section.name, pieces[0])
+			log.Printf("Comparing %s to %s\n", section.name, pieces[0])
 			if section.name == pieces[0] {
 				sec = &section
 				break argChecker
 			}
 		}
-		fmt.Printf("Couldn't find %s, creating\n", pieces[0])
+		log.Printf("Couldn't find %s, creating\n", pieces[0])
 		section := GitConfigSection{pieces[0], "", make(map[string]string, 0)}
 		sec = &section
 		g.sections = append(g.sections, section)
+	case 3:
+		key = strings.TrimSpace(pieces[2])
+		for _, section := range g.sections {
+			log.Printf("Comparing %s to %s and %s to %s\n", section.name, pieces[0], section.subsection, pieces[1])
+			if section.name == pieces[0] && section.subsection == pieces[1] {
+				sec = &section
+				break argChecker
+			}
+		}
+		log.Printf("Couldn't find %s %s, creating\n", pieces[0], pieces[1])
+		section := GitConfigSection{pieces[0], pieces[1], make(map[string]string, 0)}
+		sec = &section
+		g.sections = append(g.sections, section)
+	}
+
+	if sec != nil {
+		sec.values[key] = value
+	} else {
+		// TODO Always auto-create the sections
+		log.Printf("Couldn't find section %v\n", name)
+	}
+}
+
+func (g *GitConfig) Unset(name string) int {
+	pieces := strings.Split(name, ".")
+	var key string
+	var sec *GitConfigSection
+
+argChecker:
+	switch len(pieces) {
+	case 2:
+		key = strings.TrimSpace(pieces[1])
+		for _, section := range g.sections {
+			log.Printf("Comparing %s to %s\n", section.name, pieces[0])
+			if section.name == pieces[0] {
+				sec = &section
+				break argChecker
+			}
+		}
 	case 3:
 		key = strings.TrimSpace(pieces[2])
 		for _, section := range g.sections {
@@ -48,15 +91,20 @@ argChecker:
 				break argChecker
 			}
 		}
-		section := GitConfigSection{pieces[0], pieces[1], make(map[string]string, 0)}
-		sec = &section
-		g.sections = append(g.sections, section)
 	}
 
-	sec.values[key] = value
-	fmt.Printf("%s", sec)
+	if sec != nil {
+		if _, ok := sec.values[key]; !ok {
+			return 5
+		}
+		delete(sec.values, key)
+		return 0
+	} else {
+		return 5
+	}
 }
-func (g GitConfig) GetConfig(name string) string {
+
+func (g *GitConfig) GetConfig(name string) (string, int) {
 
 	pieces := strings.Split(name, ".")
 
@@ -64,18 +112,59 @@ func (g GitConfig) GetConfig(name string) string {
 	case 2:
 		for _, section := range g.sections {
 			if section.name == pieces[0] {
-				return section.values[pieces[1]]
+				val, ok := section.values[pieces[1]]
+				if !ok {
+					return "", 1
+				}
+				return val, 0
 			}
 		}
 	case 3:
 		for _, section := range g.sections {
 			if section.name == pieces[0] && section.subsection == pieces[1] {
-				return section.values[pieces[2]]
+				val, ok := section.values[pieces[2]]
+				if !ok {
+					return "", 1
+				}
+				return val, 0
 			}
 		}
 
 	}
-	return ""
+
+	return "", 1
+}
+
+func (g *GitConfig) GetConfigList() []string {
+	list := []string{}
+
+	for _, section := range g.sections {
+		for key, value := range section.values {
+			if section.subsection != "" {
+				list = append(list, section.name+"."+section.subsection+"."+key+"="+value)
+			} else {
+				list = append(list, section.name+"."+key+"="+value)
+			}
+		}
+	}
+
+	return list
+}
+
+// Gets all config sections that match name and subsection. The empty
+// string matches all names/subsections.
+func (g *GitConfig) GetConfigSections(name, subsection string) []GitConfigSection {
+	matches := make([]GitConfigSection, 0, len(g.sections))
+	for _, sect := range g.sections {
+		if name != "" && sect.name != name {
+			continue
+		}
+		if subsection != "" && subsection != sect.subsection {
+			continue
+		}
+		matches = append(matches, sect)
+	}
+	return matches
 }
 
 func (g GitConfig) WriteFile(w io.Writer) {
@@ -107,6 +196,7 @@ func (s *GitConfigSection) ParseValues(valueslines string) {
 		}
 		varname := strings.TrimSpace(split[0])
 
+		log.Printf("Parsed config variable %v\n", varname)
 		s.values[varname] = strings.TrimSpace(strings.Join(split[1:], "="))
 
 	}
@@ -136,11 +226,13 @@ func (s *GitConfigSection) ParseSectionHeader(headerline string) {
 		s.name = headerline
 	}
 }
+
 func ParseConfig(configFile io.Reader) GitConfig {
 	rawdata, _ := ioutil.ReadAll(configFile)
 	section := &GitConfigSection{}
 	parsingSectionName := false
 	parsingValues := false
+	var sect *GitConfigSection = nil
 	var sections []GitConfigSection
 	lastBracket := 0
 	lastClosingBracket := 0
@@ -153,20 +245,108 @@ func ParseConfig(configFile io.Reader) GitConfig {
 			if parsingValues == true {
 				section.ParseValues(string(rawdata[lastClosingBracket+1 : idx]))
 				parsingValues = false
-				sections = append(sections, *section)
+
+				if sect != nil {
+					for k, v := range section.values {
+						sect.values[k] = v
+					}
+					sect = nil
+				} else {
+					sections = append(sections, *section)
+				}
 			}
 			section = &GitConfigSection{}
 		}
 		if b == ']' && parsingSectionName == true {
 			section.ParseSectionHeader(string(rawdata[lastBracket+1 : idx]))
+
+			for _, s := range sections {
+				if s.name == section.name && s.subsection == section.subsection {
+					sect = &s
+					break
+				}
+			}
+
 			parsingValues = true
 			parsingSectionName = false
 			lastClosingBracket = idx
 		}
 		if idx == len(rawdata)-1 && parsingValues == true {
 			section.ParseValues(string(rawdata[lastClosingBracket+1 : idx]))
-			sections = append(sections, *section)
+
+			if sect != nil {
+				for k, v := range section.values {
+					sect.values[k] = v
+				}
+				sect = nil
+			} else {
+				sections = append(sections, *section)
+			}
 		}
 	}
-	return GitConfig{sections}
+	return GitConfig{sections: sections}
+}
+
+func findGlobalConfigFile() (string, error) {
+	home := os.Getenv("HOME")
+	if home == "" {
+		home = os.Getenv("home") // On some OSes, it is home
+	}
+
+	if home == "" {
+		return "", fmt.Errorf("Global git configuration could not be found since HOME and home environment variables were not defined.")
+	}
+
+	return home + "/.gitconfig", nil
+}
+
+func LoadGlobalConfig() (GitConfig, error) {
+	fname, err := findGlobalConfigFile()
+	if err != nil {
+		return GitConfig{}, err
+	}
+
+	file, err := os.OpenFile(fname, os.O_RDWR|os.O_CREATE, 0644)
+	if err != nil {
+		return GitConfig{}, err
+	}
+	config := ParseConfig(file)
+	err = file.Close()
+	if err != nil {
+		return GitConfig{}, err
+	}
+
+	config.fname = fname
+
+	return config, nil
+}
+
+func LoadLocalConfig(c *Client) (GitConfig, error) {
+	fname := filepath.Join(c.GitDir.String(), "config")
+
+	file, err := os.OpenFile(fname, os.O_RDWR|os.O_CREATE, 0644)
+	if err != nil {
+		return GitConfig{}, err
+	}
+	config := ParseConfig(file)
+	if err := file.Close(); err != nil {
+		return GitConfig{}, err
+	}
+
+	config.fname = fname
+
+	return config, nil
+}
+
+func (g GitConfig) WriteConfig() error {
+	err := os.Remove(g.fname)
+	if err != nil {
+		return err
+	}
+	configFile, err := os.Create(g.fname)
+	if err != nil {
+		return err
+	}
+	g.WriteFile(configFile)
+	return configFile.Close()
 }

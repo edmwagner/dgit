@@ -1,66 +1,138 @@
 package cmd
 
 import (
+	"errors"
+	"flag"
 	"fmt"
 	"os"
 
 	"github.com/driusan/dgit/git"
 )
 
-func Config(c *git.Client, args []string) {
-	if len(args) < 1 {
-		fmt.Fprintf(os.Stderr, "Usage: go-git config [<options>]\n")
-		return
+func Config(c *git.Client, args []string) error {
+	flags := flag.NewFlagSet("config", flag.ExitOnError)
+	flags.SetOutput(flag.CommandLine.Output())
+	flags.Usage = func() {
+		flag.Usage()
+		fmt.Fprintf(flag.CommandLine.Output(), "\n\nOptions:\n")
+		flags.PrintDefaults()
 	}
-	var fname string
 
-	if args[0] == "--global" {
-		home := os.Getenv("HOME")
-		if home == "" {
-			home = os.Getenv("home") // On some OSes, it is home
-		}
-		fname = home + "/.gitconfig"
-		args = args[1:]
+	get := flags.Bool("get", false, "Get the value for a given key")
+	unset := flags.Bool("unset", false, "Remove the line matching the key")
+	unsetall := flags.Bool("unset-all", false, "Remove all lines matching the key")
+	list := flags.Bool("list", false, "List all variables along with their values")
+	global := flags.Bool("global", false, "For writing options: write to global file rather than respository")
+
+	// Type canonicalization isn't currently supported
+	//  and so we just allow them and return the raw value
+	//  with no validation
+	flags.String("type", "", "")
+	flags.Bool("bool", false, "")
+	flags.Bool("int", false, "")
+	flags.Bool("bool-or-int", false, "")
+	flags.Bool("path", false, "")
+	flags.Bool("expiry-date", false, "")
+
+	flags.Parse(args)
+
+	var config git.GitConfig
+	var err error
+
+	if *global {
+		config, err = git.LoadGlobalConfig()
 	} else {
-		fname = c.GitDir.String() + "/config"
+		config, err = git.LoadLocalConfig(c)
 	}
 
-	file, err := os.OpenFile(fname, os.O_RDWR|os.O_CREATE, 0644)
 	if err != nil {
-		panic("Couldn't open config\n")
+		return err
 	}
-	defer file.Close()
 
-	config := git.ParseConfig(file)
 	var action string
-	switch args[0] {
-	case "--get":
+	if *get {
 		action = "get"
-		args = args[1:]
-	case "--set":
+	} else if *unset {
+		action = "unset"
+	} else if *unsetall {
+		action = "unsetall"
+	} else if *list {
+		action = "list"
+	} else if flags.NArg() == 1 {
+		action = "get"
+	} else if flags.NArg() == 2 {
 		action = "set"
-		args = args[1:]
-	default:
-		if len(args) == 1 {
-			action = "get"
-		} else if len(args) == 2 {
-			action = "set"
-		}
 	}
+
 	switch action {
 	case "get":
-		fmt.Printf("%s\n", config.GetConfig(args[0]))
-		return
+		if flags.NArg() < 1 {
+			fmt.Fprintf(flag.CommandLine.Output(), "Missing value to get\n")
+			flags.Usage()
+			os.Exit(2)
+		}
+		val := c.GetCachedConfig(flags.Arg(0))
+		if val != "" {
+			fmt.Printf("%s\n", val)
+			return nil
+		}
+		val, code := config.GetConfig(flags.Arg(0))
+		if code != 0 {
+			os.Exit(code)
+		}
+		fmt.Printf("%s\n", val)
+		return nil
 	case "set":
-		if len(args) < 2 {
-			fmt.Fprintf(os.Stderr, "Missing value to set config to\n")
-			return
+		if flags.NArg() < 2 {
+			fmt.Fprintf(flag.CommandLine.Output(), "Missing value to set config to\n")
+			flags.Usage()
+			os.Exit(2)
 		}
 
-		file.Seek(0, 0)
-		config.SetConfig(args[0], args[1])
-		config.WriteFile(file)
-		return
+		config.SetConfig(flags.Arg(0), flags.Arg(1))
+		return config.WriteConfig()
+	case "unset":
+		if flags.NArg() < 1 {
+			fmt.Fprintf(flag.CommandLine.Output(), "Missing value to unset\n")
+			flags.Usage()
+			os.Exit(2)
+		}
+		code := config.Unset(flags.Arg(0))
+		if code != 0 {
+			os.Exit(code)
+		}
+		return config.WriteConfig()
+	case "unsetall":
+		if flags.NArg() < 1 {
+			fmt.Fprintf(flag.CommandLine.Output(), "Missing value to unset all\n")
+			flags.Usage()
+			os.Exit(2)
+		}
+		found := false
+		for {
+			code := config.Unset(flags.Arg(0))
+			if code == 5 {
+				break
+			}
+			found = true
+			if code != 0 {
+				os.Exit(code)
+			}
+		}
+		if !found {
+			os.Exit(5)
+		}
+		return config.WriteConfig()
+	case "list":
+		list := config.GetConfigList()
+		for _, entry := range list {
+			fmt.Printf("%s\n", entry)
+		}
+		return nil
 	}
-	panic("Unhandled action" + args[0])
+
+	flags.Usage()
+	os.Exit(2)
+
+	return errors.New("Unhandled action")
 }

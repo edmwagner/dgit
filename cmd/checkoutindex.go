@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"flag"
+	"fmt"
 	"os"
 
 	"github.com/driusan/dgit/git"
@@ -11,22 +12,31 @@ import (
 // CheckoutIndexOptions and calls CheckoutIndex.
 func CheckoutIndexCmd(c *git.Client, args []string) error {
 	flags := flag.NewFlagSet("checkout-index", flag.ExitOnError)
+	flags.SetOutput(flag.CommandLine.Output())
+	flags.Usage = func() {
+		flag.Usage()
+		fmt.Fprintf(flag.CommandLine.Output(), "\n\nOptions:\n")
+		flags.PrintDefaults()
+		// Some git tests test for a 129 exit code if the commandline
+		// parsing fails for checkout-index.
+		os.Exit(129)
+	}
 	options := git.CheckoutIndexOptions{}
 
-	index := flags.Bool("index", false, "Update stat information for checkout out entries in the index")
-	u := flags.Bool("u", false, "Alias for --index")
+	flags.BoolVar(&options.UpdateStat, "index", false, "Update stat information for checkout out entries in the index")
+	flags.BoolVar(&options.UpdateStat, "u", false, "Alias for --index")
 
-	quiet := flags.Bool("quiet", false, "Be quiet if files exist or are not in index")
-	q := flags.Bool("q", false, "Alias for --quiet")
+	flags.BoolVar(&options.Quiet, "quiet", false, "Be quiet if files exist or are not in index")
+	flags.BoolVar(&options.Quiet, "q", false, "Alias for --quiet")
 
-	force := flags.Bool("force", false, "Force overwrite of existing files")
-	f := flags.Bool("f", false, "Alias for --force")
+	flags.BoolVar(&options.Force, "force", false, "Force overwrite of existing files")
+	flags.BoolVar(&options.Force, "f", false, "Alias for --force")
 
-	all := flags.Bool("all", false, "Checkout all files in the index.")
-	a := flags.Bool("a", false, "Alias for --all")
+	flags.BoolVar(&options.All, "all", false, "Checkout all files in the index.")
+	flags.BoolVar(&options.All, "a", false, "Alias for --all")
 
-	nocreate := flags.Bool("no-create", false, "Don't checkout new files, only refresh existing ones")
-	n := flags.Bool("n", false, "Alias for --no-create")
+	flags.BoolVar(&options.NoCreate, "no-create", false, "Don't checkout new files, only refresh existing ones")
+	flags.BoolVar(&options.NoCreate, "n", false, "Alias for --no-create")
 
 	flags.StringVar(&options.Prefix, "prefix", "", "When creating files, prepend string")
 	flags.StringVar(&options.Stage, "stage", "", "Copy files from named stage (unimplemented)")
@@ -38,11 +48,6 @@ func CheckoutIndexCmd(c *git.Client, args []string) error {
 
 	flags.Parse(args)
 	files := flags.Args()
-	options.UpdateStat = *index || *u
-	options.Quiet = *quiet || *q
-	options.Force = *force || *f
-	options.All = *all || *a
-	options.NoCreate = *nocreate || *n
 	if *stdin {
 		options.Stdin = os.Stdin
 	}

@@ -1,6 +1,8 @@
 package git
 
 import (
+	"bytes"
+	"fmt"
 	"strings"
 )
 
@@ -15,6 +17,45 @@ func (r RefSpec) String() string {
 	// This will only trim a single nil byte, but if there's more
 	// than that we're doing something really wrong.
 	return strings.TrimSpace(strings.TrimSuffix(string(r), "\000"))
+}
+
+// Src represents the ref name of the ref at the remote location for a refspec.
+// for instance, in the refspec "refs/heads/foo:refs/remotes/origin/foo",
+// src refers to refs/heads/foo, the name of the remote reference, while dst
+// refers to refs/remotes/origin/master, the location that we store our cache
+// of what that remote reference is.
+func (r RefSpec) Src() Refname {
+	if len(r) < 1 {
+		return ""
+	}
+
+	if r[0] == '+' {
+		r = r[1:]
+	}
+	if pos := strings.Index(string(r), ":"); pos >= 0 {
+		return Refname(r[:pos])
+	}
+
+	// There was no ":", so we just take the name.
+	return Refname(r)
+}
+
+// Dst represents the local destination of a remote ref in a refspec.
+// For instance, in the refspec "refs/heads/foo:refs/remotes/origin/foo",
+// Dst refers to "refs/remotes/origin/foo". If the refspec does not have an
+// explicit Dst specified, Dst returns an empty refname.
+func (r RefSpec) Dst() Refname {
+	if len(r) < 1 {
+		return ""
+	}
+
+	if r[0] == '+' {
+		r = r[1:]
+	}
+	if pos := strings.Index(string(r), ":"); pos >= 0 {
+		return Refname(r[pos+1:])
+	}
+	return ""
 }
 
 func (r RefSpec) HasPrefix(s string) bool {
@@ -34,12 +75,57 @@ func (r RefSpec) Value(c *Client) (string, error) {
 	return strings.TrimSpace(val), err
 }
 
-func (r RefSpec) CommitID(c *Client) (CommitID, error) {
+func (r RefSpec) Sha1(c *Client) (Sha1, error) {
 	v, err := r.Value(c)
+	if err != nil {
+		return Sha1{}, err
+	}
+	return Sha1FromString(v)
+}
+
+func (r RefSpec) CommitID(c *Client) (CommitID, error) {
+	sha1, err := r.Sha1(c)
 	if err != nil {
 		return CommitID{}, err
 	}
-	return CommitIDFromString(v)
+	switch t := sha1.Type(c); t {
+	case "commit":
+		return CommitID(sha1), nil
+	case "tag":
+		obj, err := c.GetObject(sha1)
+		if err != nil {
+			return CommitID{}, err
+		}
+		content := obj.GetContent()
+		reader := bytes.NewBuffer(content)
+		line, err := reader.ReadBytes('\n')
+		if err != nil {
+			return CommitID{}, err
+		}
+		objid := strings.TrimPrefix(string(line), "object ")
+		objsha, err := CommitIDFromString(objid)
+		if err != nil {
+			return CommitID{}, err
+		}
+		line, err = reader.ReadBytes('\n')
+		if err != nil {
+			return CommitID{}, err
+		}
+		if string(line) != "type commit\n" {
+			return CommitID{}, fmt.Errorf("Tag does not point to a commit: %v", string(line))
+		}
+		return objsha, nil
+	default:
+		return CommitID{}, fmt.Errorf("Invalid commit type %v", t)
+	}
+}
+
+func (r RefSpec) TreeID(c *Client) (TreeID, error) {
+	cmt, err := r.CommitID(c)
+	if err != nil {
+		return TreeID{}, err
+	}
+	return cmt.TreeID(c)
 }
 
 // A Branch is a type of RefSpec that lives under refs/heads/ or refs/remotes/heads
@@ -90,5 +176,19 @@ func (b Branch) TreeID(c *Client) (TreeID, error) {
 
 // Returns the branch name, without the refspec portion.
 func (b Branch) BranchName() string {
-	return strings.TrimPrefix(string(b), "refs/heads/")
+	s := string(b)
+	if strings.HasPrefix(s, "refs/heads/") {
+		return strings.TrimPrefix(s, "refs/heads/")
+	}
+	return strings.TrimPrefix(s, "refs/")
+}
+
+// Delete a branch
+func (b Branch) DeleteBranch(c *Client) error {
+	location := c.GitDir.File(File(b))
+	err := location.Remove()
+	if err != nil {
+		return err
+	}
+	return nil
 }

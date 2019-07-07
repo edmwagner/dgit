@@ -22,6 +22,12 @@ func PktLineEncode(line []byte) (PktLine, error) {
 	return PktLine(fmt.Sprintf("%.4x%s\n", len(line)+5, line)), nil
 }
 
+func PktLineEncodeNoNl(line []byte) (PktLine, error) {
+	if len(line) > 65535 {
+		return "", fmt.Errorf("Line too long to encode in PktLine format")
+	}
+	return PktLine(fmt.Sprintf("%.4x%s", len(line)+4, line)), nil
+}
 func (p PktLine) String() string {
 	return string(p)
 }
@@ -229,13 +235,12 @@ func (s *SmartHTTPServerRetriever) getRefs(service, expectedmime string) (io.Rea
 	}
 
 	if s.username != "" || s.password != "" {
-		println("Setting password ", s.username, s.password)
 		req.SetBasicAuth(s.username, s.password)
 	}
 	resp, err := http.DefaultClient.Do(req)
-	if resp.Header.Get("Content-Type") != expectedmime {
+	if err != nil || resp.Header.Get("Content-Type") != expectedmime {
 		// If it didn't work, close the body and try again at "url.git"
-		if err != nil {
+		if err != nil && resp != nil && resp.Body != nil {
 			resp.Body.Close()
 		}
 		s.Location = s.Location + ".git"
@@ -259,9 +264,13 @@ func (s *SmartHTTPServerRetriever) getRefs(service, expectedmime string) (io.Rea
 func (s *SmartHTTPServerRetriever) NegotiateSendPack() ([]*Reference, error) {
 	var err error
 
-	s.username = readLine("Username: ")
-	s.password = readLine("Password: ")
-	r, err := s.getRefs("git-receive-pack", "application/x-git-receive-pack-request")
+	userpass, err := getUserPassword(s.Location)
+	if err != nil {
+		return nil, err
+	}
+	s.username = userpass.user
+	s.password = userpass.password
+	r, err := s.getRefs("git-receive-pack", "application/x-git-receive-pack-advertisement")
 	if err != nil {
 		return nil, err
 	}
@@ -310,7 +319,7 @@ func (s SmartHTTPServerRetriever) NegotiatePack() ([]*Reference, io.ReadCloser, 
 func (s SmartHTTPServerRetriever) SendPack(ref UpdateReference, r io.Reader, size int64) error {
 	var toPost string
 
-	line, err := PktLineEncode([]byte(fmt.Sprintf("%s %s %s\000 report-status quiet sideband-64k agent=go-git/0.0.1", ref.RemoteSha1, ref.LocalSha1, ref.Refname.String())))
+	line, err := PktLineEncode([]byte(fmt.Sprintf("%s %s %s\000 report-status quiet sideband-64k agent=dgit/0.0.1", ref.RemoteSha1, ref.LocalSha1, ref.Refname.String())))
 	if err != nil {
 		panic(err)
 	}
@@ -323,7 +332,7 @@ func (s SmartHTTPServerRetriever) SendPack(ref UpdateReference, r io.Reader, siz
 	if err != nil {
 		return err
 	}
-	req.Header.Set("User-Agent", "go-git/0.0.1")
+	req.Header.Set("User-Agent", "dgit/0.0.1")
 
 	req.ContentLength = int64(len(toPost)) + size + 4
 	req.Header.Set("Content-Type", "application/x-git-receive-pack-request")

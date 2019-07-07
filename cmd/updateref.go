@@ -10,9 +10,10 @@ import (
 
 func UpdateRef(c *git.Client, args []string) error {
 	flags := flag.NewFlagSet("update-ref", flag.ExitOnError)
+	flags.SetOutput(flag.CommandLine.Output())
 	flags.Usage = func() {
 		flag.Usage()
-		fmt.Fprintf(os.Stderr, "\nupdate-ref options:\n\n")
+		fmt.Fprintf(flag.CommandLine.Output(), "\n\nOptions:\n")
 		flags.PrintDefaults()
 	}
 
@@ -71,6 +72,9 @@ func UpdateRef(c *git.Client, args []string) error {
 
 		return git.UpdateRef(c, opts, vals[0], cmt, *reason)
 	}
+
 	flags.Usage()
+	os.Exit(2)
+
 	return fmt.Errorf("Invalid usage")
 }

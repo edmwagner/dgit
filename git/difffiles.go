@@ -1,6 +1,7 @@
 package git
 
 import (
+	"log"
 	"sort"
 )
 
@@ -15,6 +16,9 @@ type DiffCommonOptions struct {
 
 	// Generate the diff in raw format, not a unified diff
 	Raw bool
+
+	// Exit with a exit code of 1 if there are any diffs
+	ExitCode bool
 }
 
 // Describes the options that may be specified on the command line for
@@ -26,10 +30,10 @@ type DiffFilesOptions struct {
 
 // DiffFiles implements the git diff-files command.
 // It compares the file system to the index.
-func DiffFiles(c *Client, opt DiffFilesOptions, paths []string) ([]HashDiff, error) {
+func DiffFiles(c *Client, opt DiffFilesOptions, paths []File) ([]HashDiff, error) {
 	indexentries, err := LsFiles(
 		c,
-		&LsFilesOptions{
+		LsFilesOptions{
 			Cached: true, Deleted: true, Modified: true,
 		},
 		paths,
@@ -48,18 +52,22 @@ func DiffFiles(c *Client, opt DiffFilesOptions, paths []string) ([]HashDiff, err
 		if err != nil || !f.Exists() {
 			// If there was an error, treat it as a non-existant file
 			// and just use the empty Sha1
-			val = append(val, HashDiff{idx.PathName, idxtree, fs})
+			val = append(val, HashDiff{idx.PathName, idxtree, fs, uint(idx.Fsize), 0})
 			continue
 		}
-		stat, err := f.Stat()
+		stat, err := f.Lstat()
 		if err != nil {
-			val = append(val, HashDiff{idx.PathName, idxtree, fs})
+			val = append(val, HashDiff{idx.PathName, idxtree, fs, uint(idx.Fsize), 0})
 			continue
 		}
 
 		switch {
 		case stat.Mode().IsDir():
-			fs.FileMode = ModeTree
+			// Since we're diffing files in the index (which only holds files)
+			// against a directory, it means that the file was deleted and
+			// replaced by a directory.
+			val = append(val, HashDiff{idx.PathName, idxtree, fs, uint(idx.Fsize), 0})
+			continue
 		case !stat.Mode().IsRegular():
 			// FIXME: This doesn't take into account that the file
 			// might be some kind of non-symlink non-regular file.
@@ -69,17 +77,19 @@ func DiffFiles(c *Client, opt DiffFilesOptions, paths []string) ([]HashDiff, err
 		default:
 			fs.FileMode = ModeBlob
 		}
-		fsHash, _, err := HashFile("blob", f.String())
-		if err != nil {
-			val = append(val, HashDiff{idx.PathName, idxtree, fs})
+		size := stat.Size()
+		if err := idx.CompareStat(f); err != nil {
+			log.Printf("Stat information does not match for %v: %v\n", f, err)
+			val = append(val, HashDiff{idx.PathName, idxtree, fs, uint(idx.Fsize), uint(size)})
 			continue
 		}
-		fs.Sha1 = fsHash
-		if fs != idxtree {
-			// the hash isn't in the git object store, so set it back to 0
-			// after the comparison is done
-			fs.Sha1 = Sha1{}
-			val = append(val, HashDiff{idx.PathName, idxtree, fs})
+
+		// We couldn't short-circuit by checking the stat info, so fall back on hashing
+		// the file.
+		hash, _, err := HashFile("blob", f.String())
+
+		if err != nil || hash != idx.Sha1 {
+			val = append(val, HashDiff{idx.PathName, idxtree, fs, uint(idx.Fsize), uint(size)})
 		}
 	}
 

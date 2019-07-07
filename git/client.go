@@ -4,15 +4,19 @@ import (
 	"bufio"
 	"crypto/sha1"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"log"
 	"os"
+	"os/user"
 	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/driusan/dgit/zlib"
 )
+
+var NoGlobalConfig = fmt.Errorf("No global .gitconfig file exists")
 
 // An IndexPath represents a file in the index. ie. a File path relative
 // to the Git WorkDir, not the current working directory.
@@ -64,6 +68,11 @@ func (g GitDir) WriteFile(f File, data []byte, perm os.FileMode) error {
 	return ioutil.WriteFile(g.File(f).String(), data, perm)
 }
 
+// ReadFile reads a file under the GitDir and returns the contents.
+func (g GitDir) ReadFile(f File) ([]byte, error) {
+	return ioutil.ReadFile(g.File(f).String())
+}
+
 // WorkDir is the top level of the work directory of the current process, or
 // the empty string if the --bare option is provided
 type WorkDir File
@@ -75,6 +84,19 @@ func (f WorkDir) String() string {
 type objectLocation struct {
 	loose    bool
 	packfile File
+	index    *PackfileIndexV2
+	offset   int64
+}
+
+type fileish interface {
+	io.Reader
+	io.Seeker
+	io.Closer
+}
+
+type shaRef struct {
+	Sha1
+	bool
 }
 
 // A Client represents a user of the git command inside of a git repo. It's
@@ -83,8 +105,65 @@ type Client struct {
 	GitDir  GitDir
 	WorkDir WorkDir
 
+	// This is used by the git-read-tree test suite. The description from the
+	// git man page is:
+	//
+	//        Currently for internal use only. Set a prefix which gives a path
+	//        from above a repository down to its root. One use is to give
+	//        submodules context about the superproject that invoked it.
+	//
+	// The reality as far as we're concerned is it changes the output error
+	// message of read-tree slightly.
+	SuperPrefix string
+
 	// Cache of where this client has previously found existing objects
 	objectCache map[Sha1]objectLocation
+
+	objcache map[shaRef]GitObject
+
+	// Cache of previous config lookups to avoid re-parsing.
+	configCache               map[string]string
+	localConfig, globalConfig *GitConfig
+}
+
+func (c *Client) Close() error {
+	return nil
+}
+
+// Returns true if the repo is a bare repo.
+func (c *Client) IsBare() bool {
+	return c.GetConfig("core.bare") == "true"
+}
+
+// Returns true if the path is under the client's GitDir.
+func (c *Client) IsInsideGitDir(path File) bool {
+	abs, err := filepath.Abs(path.String())
+	if err != nil {
+		panic(err)
+	}
+	absgd, err := filepath.Abs(c.GitDir.String())
+	if err != nil {
+		panic(err)
+	}
+	return strings.HasPrefix(abs, absgd)
+}
+
+// Returns true if path is inside of the client's work tree.
+func (c *Client) IsInsideWorkTree(path File) bool {
+	if c.IsBare() || c.IsInsideGitDir(path) {
+		return false
+	}
+
+	abs, err := filepath.Abs(path.String())
+	if err != nil {
+		panic(err)
+	}
+	abswt, err := filepath.Abs(c.WorkDir.String())
+	if err != nil {
+		panic(err)
+	}
+	return strings.HasPrefix(abs, abswt)
+
 }
 
 // Walks from the current directory to find a .git directory
@@ -104,6 +183,24 @@ func findGitDir() GitDir {
 			return GitDir(dir) + "/.git"
 		}
 	}
+
+	// This could be a bare repository, let's check the configuration
+	configFileName := filepath.Join(startPath, "config")
+
+	configFile, err := os.Open(configFileName)
+	if err != nil {
+		return ""
+	}
+	config := ParseConfig(configFile)
+	if err := configFile.Close(); err != nil {
+		return ""
+	}
+
+	bareVar, _ := config.GetConfig("core.bare")
+	if bareVar == "true" {
+		return GitDir(startPath)
+	}
+
 	return ""
 }
 
@@ -125,14 +222,12 @@ func NewClient(gitDir, workDir string) (*Client, error) {
 	workdir := WorkDir(workDir)
 	if workdir == "" {
 		workdir = WorkDir(os.Getenv("GIT_WORK_TREE"))
-		if workdir == "" {
+		if workdir == "" && strings.HasSuffix(gitdir.String(), "/.git") {
 			workdir = WorkDir(strings.TrimSuffix(gitdir.String(), "/.git"))
 		}
-		// TODO: Check the GIT_WORK_TREE os environment, then strip .git
-		// from the gitdir if it doesn't exist.
 	}
 	m := make(map[Sha1]objectLocation)
-	return &Client{GitDir(gitdir), WorkDir(workdir), m}, nil
+	return &Client{GitDir(gitdir), WorkDir(workdir), "", m, make(map[shaRef]GitObject), nil, nil, nil}, nil
 }
 
 // Returns the branchname of the HEAD branch, or the empty string if the
@@ -156,7 +251,14 @@ func (gd GitDir) Open(f File) (*os.File, error) {
 // Creates a file relative to GitDir. There should not be
 // a leading slash.
 func (gd GitDir) Create(f File) (*os.File, error) {
-	return os.Create(gd.String() + "/" + f.String())
+	fpath := filepath.Join(gd.String(), f.String())
+	dir := File(filepath.Dir(fpath))
+	if !dir.Exists() {
+		if err := os.MkdirAll(dir.String(), 0755); err != nil {
+			return nil, err
+		}
+	}
+	return os.Create(fpath)
 }
 
 // ResetWorkTree will replace all objects in c.WorkDir with the content from
@@ -185,13 +287,46 @@ func (c *Client) ResetWorkTree() error {
 }
 
 // Return valid branches that a Client knows about.
-func (c *Client) GetBranches() (branches []Branch, err error) {
-	files, err := ioutil.ReadDir(c.GitDir.String() + "/refs/heads")
+func (c *Client) GetBranches() ([]Branch, error) {
+	files := []string{}
+
+	err := filepath.Walk(filepath.Join(c.GitDir.String(), "refs", "heads"),
+		func(path string, info os.FileInfo, err error) error {
+			if err != nil {
+				return err
+			}
+			if !info.IsDir() {
+				files = append(files, path)
+			}
+			return nil
+		})
 	if err != nil {
 		return nil, err
 	}
+
+	branches := []Branch{}
 	for _, f := range files {
-		branches = append(branches, Branch("refs/heads/"+f.Name()))
+		branches = append(branches, Branch(f[len(c.GitDir.String())+1:]))
+	}
+	return branches, nil
+}
+
+// Return valid branches that a Client knows about.
+func (c *Client) GetRemoteBranches() (branches []Branch, err error) {
+	remotes, err := ioutil.ReadDir(c.GitDir.String() + "/refs/remotes")
+	if err != nil {
+		return nil, err
+	}
+	for _, d := range remotes {
+		if d.IsDir() {
+			brs, err := ioutil.ReadDir(c.GitDir.String() + "/refs/remotes/" + d.Name())
+			if err != nil {
+				continue
+			}
+			for _, b := range brs {
+				branches = append(branches, Branch("refs/remotes/"+d.Name()+"/"+b.Name()))
+			}
+		}
 	}
 	return
 }
@@ -200,6 +335,15 @@ func (c *Client) GetBranches() (branches []Branch, err error) {
 func (c *Client) CreateBranch(name string, commit Commitish) error {
 	id, err := commit.CommitID(c)
 	if err != nil {
+		return err
+	}
+
+	if name == "HEAD" {
+		return fmt.Errorf("fatal: 'HEAD' is not a valid branch name.")
+	}
+
+	// Create the file using File.Create first to ensure any parent directories are created.
+	if err := c.GitDir.File(File("refs/heads/" + name)).Create(); err != nil {
 		return err
 	}
 
@@ -220,30 +364,100 @@ func (p Person) String() string {
 	if p.Time == nil {
 		return fmt.Sprintf("%s <%s>", p.Name, p.Email)
 	}
-	_, tzoff := p.Time.Zone()
+	return fmt.Sprintf("%s <%s> %s", p.Name, p.Email, timeToGitTime(*p.Time))
+
+}
+
+func timeToGitTime(t time.Time) string {
+	_, tzoff := t.Zone()
 	// for some reason t.Zone() returns the timezone offset in seconds
 	// instead of hours, so convert it to an hour format string
 	tzStr := fmt.Sprintf("%+03d00", tzoff/(60*60))
-	return fmt.Sprintf("%s <%s> %d %s", p.Name, p.Email, p.Time.Unix(), tzStr)
-
+	val := fmt.Sprintf("%d %s", t.Unix(), tzStr)
+	return val
 }
 
 // Returns the author that should be used for a commit message.
 // If time t is provided,
 func (c *Client) GetAuthor(t *time.Time) Person {
-	home := os.Getenv("HOME")
-	if home == "" {
-		home = os.Getenv("home") // On some OSes, it is home
+	person := Person{}
+	name := os.Getenv("GIT_AUTHOR_NAME")
+	email := os.Getenv("GIT_AUTHOR_EMAIL")
+
+	// git config
+	if name == "" {
+		name = c.GetConfig("user.name")
 	}
-	configFile, err := os.Open(home + "/.gitconfig")
-	config := ParseConfig(configFile)
-	if err != nil {
-		panic(err)
+	if email == "" {
+		email = c.GetConfig("user.email")
 	}
 
-	name := config.GetConfig("user.name")
-	email := config.GetConfig("user.email")
-	return Person{name, email, t}
+	// system defaults
+	if name == "" || email == "" {
+		u, err := user.Current()
+		if err != nil {
+			panic(err)
+		}
+
+		if name == "" {
+			name = u.Name
+		}
+
+		if email == "" {
+			h, err := os.Hostname()
+			if err != nil {
+				panic(err)
+			}
+			email = fmt.Sprintf("%s@%s", u.Name, h)
+		}
+	}
+	person.Name = name
+	person.Email = email
+	person.Time = t
+	return person
+}
+
+// Returns the author that should be used for a commit message.
+// If time t is provided, it will return a person with the time
+// part populated to t.
+func (c *Client) GetCommitter(t *time.Time) (Person, error) {
+	person := Person{}
+	name := os.Getenv("GIT_COMMITTER_NAME")
+	email := os.Getenv("GIT_COMMITTER_EMAIL")
+	var configerr error
+
+	// git config
+	if name == "" {
+		name = c.GetConfig("user.name")
+	}
+	if email == "" {
+		email = c.GetConfig("user.email")
+	}
+
+	// system defaults
+	if name == "" || email == "" {
+		u, err := user.Current()
+		if err != nil {
+			panic(err)
+		}
+
+		if name == "" {
+			name = u.Name
+		}
+
+		if email == "" {
+			h, err := os.Hostname()
+			if err != nil {
+				panic(err)
+			}
+			email = fmt.Sprintf("%s@%s", u.Name, h)
+		}
+		configerr = NoGlobalConfig
+	}
+	person.Name = name
+	person.Email = email
+	person.Time = t
+	return person, configerr
 }
 
 // Resets the index to the Treeish tree and save the results in
@@ -274,9 +488,7 @@ func (c *Client) WriteObject(objType string, rawdata []byte) (Sha1, error) {
 			return Sha1{}, err
 
 		}
-
-		return Sha1(sha), ObjectExists
-
+		return Sha1(sha), nil
 	}
 	directory := fmt.Sprintf("%x", sha[0:1])
 	file := fmt.Sprintf("%x", sha[1:])
@@ -308,7 +520,7 @@ func (f IndexPath) IsClean(c *Client, s Sha1) bool {
 	}
 	fs, _, err := HashFile("blob", fi.String())
 	if err != nil {
-		panic(err)
+		return false
 	}
 	return fs == s
 }
@@ -339,19 +551,24 @@ func (c *Client) GetHeadCommit() (CommitID, error) {
 func (c *Client) HaveObject(id Sha1) (found bool, packedfile File, err error) {
 	// If it's cached, avoid the overhead
 	if val, ok := c.objectCache[id]; ok {
+		log.Printf("Object %s was found in the cache\n", id)
 		return true, val.packfile, nil
 	}
 
 	// First the easy case
 	if f := c.GitDir.File(File(fmt.Sprintf("objects/%02x/%018x", id[0], id[1:]))); f.Exists() {
-		c.objectCache[id] = objectLocation{true, ""}
+		log.Printf("Object %s was found in the objects directory\n", id)
+		c.objectCache[id] = objectLocation{true, "", nil, 0}
 		return true, "", nil
 	}
 
 	// Then, check if it's in a pack file.
 	files, err := ioutil.ReadDir(c.GitDir.File("objects/pack").String())
 	if err != nil {
-		return false, "", err
+		// The pack directory doesn't exist. It's not an error, but it definitely
+		// doesn't have the file..
+		log.Printf("No pack directories to search for object %s\n", id)
+		return false, "", nil
 	}
 	for _, fi := range files {
 		if filepath.Ext(fi.Name()) == ".idx" {
@@ -368,10 +585,86 @@ func (c *Client) HaveObject(id Sha1) (found bool, packedfile File, err error) {
 			if v2PackIndexHasSha1(c, pfile, buf, id) {
 				// We want to return the pack file, not the index.
 				f.Close()
+				log.Printf("Found object %s in pack file %s\n", id, fi.Name())
 				return true, pfile, nil
 			}
 			f.Close()
 		}
 	}
+
+	log.Printf("None of the pack files has object %s\n", id)
 	return false, "", nil
+}
+
+// Sets a cached config for this session only. None of these configs
+// will be persisted into the local or global configuration. Once the
+// client is closed or is garbage collected the configuration is lost.
+func (c *Client) SetCachedConfig(varname string, value string) {
+	if c.configCache == nil {
+		c.configCache = make(map[string]string)
+	}
+
+	c.configCache[varname] = value
+}
+
+// Gets a cached config variable if it is there. Otherwise, it returns
+//  and empty string.
+func (c *Client) GetCachedConfig(varname string) string {
+	if c.configCache == nil {
+		return ""
+	}
+
+	return c.configCache[varname]
+}
+
+// Loads a config variable for the git repo hosted by c.
+// If the local variable exists, it will be used, otherwise
+// it will use the global variable.
+// Non-existent variables will return the empty string.
+func (c *Client) GetConfig(varname string) string {
+	if c.configCache == nil {
+		c.configCache = make(map[string]string)
+	}
+	if val, ok := c.configCache[varname]; ok {
+		return val
+	}
+	if c.localConfig == nil {
+		config, err := LoadLocalConfig(c)
+		if err == nil {
+			c.localConfig = &config
+		} else {
+			// If there was an error we store
+			// a non-nil empty value in the localconfig
+			// cache to prevent it from being re-parsed
+			c.localConfig = &GitConfig{}
+		}
+	}
+	if val, _ := c.localConfig.GetConfig(varname); val != "" {
+		c.configCache[varname] = val
+		return val
+	}
+	if c.globalConfig == nil {
+		config, err := LoadGlobalConfig()
+		if err == nil {
+			c.globalConfig = &config
+		} else {
+			// If there was an error we store
+			// a non-nil empty value in the localconfig
+			// cache to prevent it from being re-parsed
+			c.globalConfig = &GitConfig{}
+		}
+	}
+	if val, _ := c.globalConfig.GetConfig(varname); val != "" {
+		c.configCache[varname] = val
+		return val
+	}
+	return ""
+}
+
+// Returns the .git/objects directory.
+func (c *Client) GetObjectsDir() File {
+	if objdir := os.Getenv("GIT_OBJECT_DIRECTORY"); objdir != "" {
+		return File(objdir)
+	}
+	return c.GitDir.File("objects")
 }

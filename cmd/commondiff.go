@@ -3,7 +3,7 @@ package cmd
 import (
 	"flag"
 	"fmt"
-	"log"
+	"os"
 
 	"github.com/driusan/dgit/git"
 )
@@ -22,7 +22,9 @@ func parseCommonDiffFlags(c *git.Client, options *git.DiffCommonOptions, default
 	s := flags.Bool("s", false, "Alias of --no-patch")
 	unified := flags.Int("unified", 3, "Generate <n> lines of context")
 	U := flags.Int("U", 3, "Alias of --unified")
+	U0 := flags.Bool("U0", false, "Alias of -U 0. (This is primarily for test compatibility)")
 	flags.BoolVar(&options.Raw, "raw", true, "Generate the diff in raw format")
+	flags.BoolVar(&options.ExitCode, "exit-code", false, "Exit with an exit code of 1 if there are any diffs")
 
 	flags.Parse(args)
 	args = flags.Args()
@@ -36,11 +38,15 @@ func parseCommonDiffFlags(c *git.Client, options *git.DiffCommonOptions, default
 	}
 
 	if *unified != 3 && *U != 3 {
-		return nil, fmt.Errorf("Can not specify both --unified and -U")
+		fmt.Fprintf(flag.CommandLine.Output(), "Can not specify both --unified and -U\n")
+		flags.Usage()
+		os.Exit(2)
 	} else if *unified != 3 {
 		options.NumContextLines = *unified
 	} else if *U != 3 {
 		options.NumContextLines = *U
+	} else if *U0 {
+		options.NumContextLines = 0
 	} else {
 		options.NumContextLines = 3
 	}
@@ -49,23 +55,14 @@ func parseCommonDiffFlags(c *git.Client, options *git.DiffCommonOptions, default
 
 // Print the diffs that come back from either diff-files, diff-index, or diff-tree
 // in the appropriate format according to options.
-func printDiffs(c *git.Client, options git.DiffCommonOptions, diffs []git.HashDiff) {
-	for _, diff := range diffs {
-		if options.Raw {
-			fmt.Printf("%v\n", diff)
-		}
-		if options.Patch {
-			f, err := diff.Name.FilePath(c)
-			if err != nil {
-				log.Println(err)
-			}
-			patch, err := diff.ExternalDiff(c, diff.Src, diff.Dst, f, options)
-			if err != nil {
-				log.Print(err)
-			} else {
-				fmt.Printf("diff --git a/%v b/%v\n%v\n", diff.Name, diff.Name, patch)
-			}
+func printDiffs(c *git.Client, options git.DiffCommonOptions, diffs []git.HashDiff) error {
+	if err := git.GeneratePatch(c, options, diffs, nil); err != nil {
+		return err
+	}
+	if options.ExitCode {
+		if len(diffs) > 0 {
+			os.Exit(1)
 		}
 	}
-
+	return nil
 }

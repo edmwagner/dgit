@@ -1,6 +1,7 @@
 package git
 
 import (
+	"bufio"
 	"bytes"
 	"compress/zlib"
 	"errors"
@@ -31,6 +32,9 @@ func (GitBlobObject) GetType() string {
 	return "blob"
 }
 func (b GitBlobObject) GetContent() []byte {
+	if b.content == nil {
+		panic("Attempted to get content but only loaded metadata")
+	}
 	if len(b.content) != b.size {
 		panic(fmt.Sprintf("Content of blob does not match size. %d != %d", len(b.content), b.size))
 	}
@@ -44,12 +48,44 @@ func (b GitBlobObject) String() string {
 	return string(b.content)
 }
 
+type GitTagObject struct {
+	size    int
+	content []byte
+}
+
+func (GitTagObject) GetType() string {
+	return "tag"
+}
+func (b GitTagObject) GetContent() []byte {
+	if b.content == nil {
+		panic("Attempted to get content but only loaded metadata")
+	}
+	if len(b.content) != b.size {
+		panic(fmt.Sprintf("Content of blob does not match size. %d != %d", len(b.content), b.size))
+	}
+	return b.content
+}
+func (b GitTagObject) GetSize() int {
+	return b.size
+}
+
+func (b GitTagObject) String() string {
+	return string(b.content)
+}
+
+func (c GitTagObject) GetHeader(header string) string {
+	return getObjectHeader(c.content, header)
+}
+
 type GitCommitObject struct {
 	size    int
 	content []byte
 }
 
 func (c GitCommitObject) GetContent() []byte {
+	if c.content == nil {
+		panic("Attempted to get content but only loaded metadata")
+	}
 	return c.content
 }
 
@@ -63,12 +99,57 @@ func (c GitCommitObject) String() string {
 	return string(c.content)
 }
 
+func objectHeaderCount(content []byte) map[string]int {
+	rv := make(map[string]int)
+	reader := bytes.NewBuffer(content)
+	for line, err := reader.ReadBytes('\n'); err == nil; line, err = reader.ReadBytes('\n') {
+		if len(line) == 0 || len(line) == 1 {
+			// EOF or just a '\n', separating the headers from the body
+			break
+		}
+		if pos := bytes.IndexAny(line, " "); pos >= 0 {
+			header := string(line[:pos])
+			val, ok := rv[header]
+			if ok {
+				rv[header] = val + 1
+			} else {
+				rv[header] = 1
+			}
+		}
+	}
+	return rv
+}
+
+// get a header for either a commit or tag type object.
+func getObjectHeader(content []byte, header string) string {
+	headerPrefix := []byte(header + " ")
+	reader := bytes.NewBuffer(content)
+	for line, err := reader.ReadBytes('\n'); err == nil; line, err = reader.ReadBytes('\n') {
+		if len(line) == 0 || len(line) == 1 {
+			// EOF or just a '\n', separating the headers from the body
+			return ""
+		}
+		if bytes.HasPrefix(line, headerPrefix) {
+			line = bytes.TrimSuffix(line, []byte{'\n'})
+			return string(bytes.TrimPrefix(line, headerPrefix))
+		}
+	}
+	return ""
+}
+
+func (c GitCommitObject) GetHeader(header string) string {
+	return getObjectHeader(c.content, header)
+}
+
 type GitTreeObject struct {
 	size    int
 	content []byte
 }
 
 func (t GitTreeObject) GetContent() []byte {
+	if t.content == nil {
+		panic("Attempted to get content but only loaded metadata")
+	}
 	return t.content
 }
 
@@ -125,23 +206,62 @@ func (t GitTreeObject) String() string {
 // Returns the byte array of a packed object from packfile, after
 // resolving any deltas. (packfile should be the base name with no
 // extension.)
-func (c *Client) getPackedObject(packfile File, sha1 Sha1) (GitObject, error) {
-	idx, err := (packfile + ".idx").Open()
+func (c *Client) getPackedObject(packfile File, sha1 Sha1, metaOnly bool) (GitObject, error) {
+	cacheloc, cached := c.objectCache[sha1]
+	if !cached {
+		panic("Attempt to use pack file before parsing index.")
+	}
+
+	f, err := os.Open((cacheloc.packfile + ".pack").String())
 	if err != nil {
 		return nil, err
 	}
-	defer idx.Close()
+	defer f.Close()
+	return cacheloc.index.getObjectAtOffset(f, cacheloc.offset, metaOnly)
+}
 
-	data, err := (packfile + ".pack").Open()
+func (c *Client) GetCommitObject(commit CommitID) (GitCommitObject, error) {
+	o, err := c.GetObject(Sha1(commit))
 	if err != nil {
-		return nil, err
+		return GitCommitObject{}, err
 	}
-	defer data.Close()
+	gco, ok := o.(GitCommitObject)
+	if ok {
+		return gco, nil
+	}
+	return gco, fmt.Errorf("Could not convert commit ID %v to commit object: %v", commit, err)
+}
 
-	return getPackFileObject(idx, data, sha1)
+func (c *Client) GetTagObject(tag Sha1) (GitTagObject, error) {
+	o, err := c.GetObject(tag)
+	if err != nil {
+		return GitTagObject{}, err
+	}
+
+	gco, ok := o.(GitTagObject)
+	if ok {
+		return gco, nil
+	}
+	return gco, fmt.Errorf("Could not convert ID %v to tag object: %v", tag, err)
+}
+func (c *Client) GetObjectMetadata(sha1 Sha1) (string, uint64, error) {
+	obj, err := c.getObject(sha1, true)
+	if err != nil {
+		return "", 0, err
+	}
+	return obj.GetType(), uint64(obj.GetSize()), nil
 }
 
 func (c *Client) GetObject(sha1 Sha1) (GitObject, error) {
+	return c.getObject(sha1, false)
+}
+
+func (c *Client) getObject(sha1 Sha1, metaOnly bool) (GitObject, error) {
+	if gobj, ok := c.objcache[shaRef{sha1, metaOnly}]; ok {
+		// FIXME: We should determine why this is attempting to retrieve the
+		// same things multiple times and fix the source.
+		return gobj, nil
+	}
 	found, packfile, err := c.HaveObject(sha1)
 	if err != nil {
 		return nil, err
@@ -153,7 +273,12 @@ func (c *Client) GetObject(sha1 Sha1) (GitObject, error) {
 
 	var b []byte
 	if packfile != "" {
-		return c.getPackedObject(packfile, sha1)
+		gobj, err := c.getPackedObject(packfile, sha1, metaOnly)
+		if err != nil {
+			return nil, err
+		}
+		c.objcache[shaRef{sha1, metaOnly}] = gobj
+		return gobj, nil
 	} else {
 		objectname := fmt.Sprintf("%s/objects/%x/%x", c.GitDir, sha1[0:1], sha1[1:])
 		f, err := os.Open(objectname)
@@ -165,11 +290,36 @@ func (c *Client) GetObject(sha1 Sha1) (GitObject, error) {
 		if err != nil {
 			return nil, err
 		}
-		b, err = ioutil.ReadAll(uncompressed)
-		if err != nil {
-			return nil, err
-		}
+		if metaOnly {
+			buf := bufio.NewReader(uncompressed)
+			line, err := buf.ReadBytes(0)
 
+			pieces := strings.Fields(string(bytes.TrimSuffix(line, []byte{0})))
+			if len(pieces) != 2 {
+				return nil, fmt.Errorf("Invalid object")
+			}
+			sz, err := strconv.Atoi(pieces[1])
+			if err != nil {
+				return nil, fmt.Errorf("Invalid size: %v", err)
+			}
+			switch pieces[0] {
+			case "blob":
+				return GitBlobObject{sz, nil}, nil
+			case "tree":
+				return GitTreeObject{sz, nil}, nil
+			case "commit":
+				return GitCommitObject{sz, nil}, nil
+			case "tag":
+				return GitTagObject{sz, nil}, nil
+			}
+			return nil, fmt.Errorf("Unknown object type: %v", pieces[0])
+		} else {
+			b, err = ioutil.ReadAll(uncompressed)
+
+			if err != nil {
+				return nil, err
+			}
+		}
 	}
 
 	if strings.HasPrefix(string(b), "blob ") {
@@ -184,7 +334,9 @@ func (c *Client) GetObject(sha1 Sha1) (GitObject, error) {
 				break
 			}
 		}
-		return GitBlobObject{size, content}, nil
+		gobj := GitBlobObject{size, content}
+		c.objcache[shaRef{sha1, metaOnly}] = gobj
+		return gobj, nil
 	} else if strings.HasPrefix(string(b), "commit ") {
 		var size int
 		var content []byte
@@ -197,7 +349,9 @@ func (c *Client) GetObject(sha1 Sha1) (GitObject, error) {
 				break
 			}
 		}
-		return GitCommitObject{size, content}, nil
+		gobj := GitCommitObject{size, content}
+		c.objcache[shaRef{sha1, metaOnly}] = gobj
+		return gobj, nil
 	} else if strings.HasPrefix(string(b), "tree ") {
 		var size int
 		var content []byte
@@ -210,9 +364,24 @@ func (c *Client) GetObject(sha1 Sha1) (GitObject, error) {
 				break
 			}
 		}
-		return GitTreeObject{size, content}, nil
-	} else {
-		fmt.Printf("Content: %s\n", string(b))
+		gobj := GitTreeObject{size, content}
+		c.objcache[shaRef{sha1, metaOnly}] = gobj
+		return gobj, nil
+	} else if strings.HasPrefix(string(b), "tag ") {
+		var size int
+		var content []byte
+		for idx, val := range b {
+			if val == 0 {
+				content = b[idx+1:]
+				if size, err = strconv.Atoi(string(b[4:idx])); err != nil {
+					fmt.Printf("Error converting % x to int at idx: %d", b[5:idx], idx)
+				}
+				break
+			}
+		}
+		gobj := GitTagObject{size, content}
+		c.objcache[shaRef{sha1, metaOnly}] = gobj
+		return gobj, nil
 	}
 	return nil, InvalidObject
 }

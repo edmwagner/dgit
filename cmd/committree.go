@@ -1,90 +1,104 @@
 package cmd
 
 import (
-	"bytes"
+	"flag"
 	"fmt"
 	"io/ioutil"
 	"os"
 	"strings"
-	"time"
 
 	"github.com/driusan/dgit/git"
 )
 
 func CommitTree(c *git.Client, args []string) (git.CommitID, error) {
-	content := bytes.NewBuffer(nil)
+	flags := flag.NewFlagSet("commit-tree", flag.ExitOnError)
+	flags.SetOutput(flag.CommandLine.Output())
+	flags.Usage = func() {
+		flag.Usage()
+		fmt.Fprintf(flag.CommandLine.Output(), "\n\nOptions:\n")
+		flags.PrintDefaults()
+	}
 
-	var parents []string
-	var messageString, messageFile string
-	var skipNext bool
-	var tree string
-	for idx, val := range args {
-		if idx == 0 && val[0] != '-' {
-			tree = val
-			continue
-		}
+	var p []string
+	flags.Var(NewMultiStringValue(&p), "p", "Each -p indicates the id of a parent commit object")
+	var m []string
+	flags.Var(NewMultiStringValue(&m), "m", "A paragraph in the commit log messages. This can be given more than once.")
+	messageFile := ""
+	flags.StringVar(&messageFile, "F", "", "Read the commit log message from the given file.")
 
-		if skipNext == true {
-			skipNext = false
-			continue
-		}
-		switch val {
-		case "-p":
-			parents = append(parents, args[idx+1])
-			skipNext = true
-		case "-m":
-			messageString += "\n" + args[idx+1] + "\n"
-			skipNext = true
-		case "-F":
-			messageFile = args[idx+1]
-			skipNext = true
-
+	// Commit-tree allows flags to go after the tree but flag package doesnt support it
+	// We shift them to the beginning of the arguments list and parse again.
+	extraFlags := []string{}
+	newArgs := []string{}
+	foundTree := false
+	for idx, arg := range args {
+		if foundTree && (arg == "-p" || arg == "-m" || arg == "-F" || len(extraFlags)%2 == 1) {
+			extraFlags = append(extraFlags, arg)
+		} else if foundTree {
+			newArgs = append(newArgs, arg)
+		} else if idx%2 == 0 && !strings.HasPrefix(arg, "-") {
+			newArgs = append(newArgs, arg)
+			foundTree = true
 		}
 	}
-	if messageString == "" && messageFile == "" {
+
+	args = args[:len(args)-len(newArgs)-len(extraFlags)]
+	args = append(args, extraFlags...)
+	args = append(args, newArgs...)
+
+	flags.Parse(args)
+
+	finalMessage := strings.Join(m, "\n\n") + "\n"
+
+	if len(flags.Args()) != 1 {
+		flags.Usage()
+		os.Exit(2)
+	}
+
+	tree, err := git.RevParseTreeish(c, &git.RevParseOptions{}, flags.Arg(0))
+	if err != nil {
+		return git.CommitID{}, err
+	}
+
+	knownCommits := make(map[git.CommitID]bool)
+
+	var parents []git.CommitID
+	for _, parent := range p {
+		pid, err := git.RevParseCommitish(c, &git.RevParseOptions{}, parent)
+		if err != nil {
+			return git.CommitID{}, err
+		}
+
+		pcid, err := pid.CommitID(c)
+		if err != nil {
+			return git.CommitID{}, err
+		}
+
+		if _, ok := knownCommits[pcid]; ok {
+			// skip parents that have already been added
+			continue
+		}
+
+		parents = append(parents, pcid)
+		knownCommits[pcid] = true
+
+	}
+
+	if (finalMessage == "\n" && messageFile == "") || messageFile == "-" {
 		// No -m or -F provided, read from STDIN
 		m, err := ioutil.ReadAll(os.Stdin)
 		if err != nil {
-			panic(err)
+			return git.CommitID{}, err
 		}
-		messageString = "\n" + string(m)
-	} else if messageString == "" && messageFile != "" {
+		finalMessage = "\n" + string(m)
+	} else if messageFile != "" {
 		// No -m, but -F was provided. Read from file passed.
 		m, err := ioutil.ReadFile(messageFile)
 		if err != nil {
-			panic(err)
+			return git.CommitID{}, err
 		}
-		messageString = "\n" + string(m)
+		finalMessage = "\n" + string(m)
 	}
 
-	lines := strings.Split(messageString, "\n")
-	var strippedLines []string
-	for _, line := range lines {
-		if len(line) >= 1 && line[0] == '#' {
-			continue
-		}
-		strippedLines = append(strippedLines, line)
-	}
-	messageString = strings.Join(strippedLines, "\n")
-	if strings.TrimSpace(messageString) == "" {
-		return git.CommitID{}, fmt.Errorf("Aborting due to empty commit message")
-	}
-
-	if tree == "" {
-		tree = args[len(args)-1]
-	}
-	// TODO: Validate tree id
-	fmt.Fprintf(content, "tree %s\n", tree)
-	for _, val := range parents {
-		fmt.Fprintf(content, "parent %s\n", val)
-	}
-
-	now := time.Now()
-	author := c.GetAuthor(&now)
-	fmt.Fprintf(content, "author %s\n", author)
-	fmt.Fprintf(content, "committer %s\n", author)
-	fmt.Fprintf(content, "%s", messageString)
-	fmt.Printf("%s", content.Bytes())
-	sha1, err := c.WriteObject("commit", content.Bytes())
-	return git.CommitID(sha1), err
+	return git.CommitTree(c, git.CommitTreeOptions{}, tree, parents, strings.TrimSpace(finalMessage)+"\n")
 }

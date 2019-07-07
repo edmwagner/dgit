@@ -99,8 +99,8 @@ func Merge(c *Client, opts MergeOptions, others []Commitish) error {
 	commitsWithHead := []Commitish{head}
 	commitsWithHead = append(commitsWithHead, others...)
 
-	// Find the mergebase
-	base, err := MergeBaseOctopus(c, commitsWithHead)
+	// Find the mergebase. Use --octopus if there's more than 2 commits.
+	base, err := MergeBase(c, MergeBaseOptions{Octopus: len(commitsWithHead) > 2}, commitsWithHead)
 	if err != nil {
 		return err
 	}
@@ -126,12 +126,12 @@ func Merge(c *Client, opts MergeOptions, others []Commitish) error {
 		}
 		var refmsg string
 		if b, ok := others[0].(Branch); ok && b.BranchName() != "" {
-			refmsg = fmt.Sprintf("merge %s into %s: Fast-forward (go-git)", b.BranchName(), c.GetHeadBranch().BranchName())
+			refmsg = fmt.Sprintf("merge %s into %s: Fast-forward (dgit)", b.BranchName(), c.GetHeadBranch().BranchName())
 		} else {
-			refmsg = fmt.Sprintf("merge into %s: Fast-forward (go-git)", c.GetHeadBranch().BranchName())
+			refmsg = fmt.Sprintf("merge into %s: Fast-forward (dgit)", c.GetHeadBranch().BranchName())
 		}
 
-		return UpdateRef(c, UpdateRefOptions{OldValue: head}, "HEAD", dstc, refmsg)
+		return UpdateRef(c, UpdateRefOptions{OldValue: head, CreateReflog: true}, "HEAD", dstc, refmsg)
 	}
 
 	if opts.FastForwardOnly {
@@ -148,7 +148,7 @@ func Merge(c *Client, opts MergeOptions, others []Commitish) error {
 		return err
 	}
 
-	idx, err := ReadTreeMerge(c,
+	idx, err := ReadTreeThreeWay(c,
 		ReadTreeOptions{
 			Merge:  true,
 			Update: true,

@@ -47,11 +47,11 @@ func SymbolicRefGet(c *Client, opts SymbolicRefOptions, symname SymbolicRef) (Re
 		return RefSpec(value), DetachedHead
 	}
 	if opts.Short {
-		return RefSpec(strings.TrimPrefix(value, "ref: refs/heads/")), nil
+		return RefSpec(strings.TrimSpace(strings.TrimPrefix(value, "ref: refs/heads/"))), nil
 	}
-	return RefSpec(strings.TrimPrefix(value, "ref: ")), nil
-
+	return RefSpec(strings.TrimSpace(strings.TrimPrefix(value, "ref: "))), nil
 }
+
 func SymbolicRefDelete(c *Client, opts SymbolicRefOptions, symname SymbolicRef) error {
 	file := c.GitDir.File(File(symname))
 	if !file.Exists() {
